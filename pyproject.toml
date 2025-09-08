@@ -3,19 +3,19 @@ requires = ["hatchling>=1.18.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "autopack"
+name = "autopack-grn"
 version = "0.1.1"
 description = "CLI to quantize and release Hugging Face models in multiple formats"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 authors = [
-  { name = "AutoRelease" }
+  { name = "GranulaVision" }
 ]
 keywords = ["transformers", "quantization", "huggingface", "bitsandbytes", "onnx", "gguf"]
 classifiers = [
   "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: MIT License",
+  "License :: OSI Approved :: Apache Software License",
   "Operating System :: OS Independent",
 ]
 dependencies = [
@@ -46,5 +46,14 @@ autopack = "autopack.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["autopack"]
+exclude = [
+  "/third_party/**",
+]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+  "/third_party/**",
+  "/dist/**",
+]
 
 

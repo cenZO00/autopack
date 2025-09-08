@@ -1,6 +1,6 @@
 <div align="center">
   <a href="https://granulavision.com">
-    <img src="media/banner.svg">
+    <img src="media/banner.jpg">
   </a>
 
 <h3 align="center">autopack</h3>

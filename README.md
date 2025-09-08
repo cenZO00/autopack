@@ -1,6 +1,6 @@
 <div align="center">
   <a href="https://granulavision.com">
-    <img src="media/banner.jpg">
+    <img src="https://raw.githubusercontent.com/GranulaVision/autopack/refs/heads/main/media/banner.jpg">
   </a>
 
 <h3 align="center">autopack</h3>
@@ -65,29 +65,41 @@ autopack auto meta-llama/Llama-3-8B -o out/llama
 ## Install
 
 ```bash
-pip install -e .
+pip install autopack-grn
 ```
 
 ### Optional extras
 
 ```bash
 # ONNX export support
-pip install -e '.[onnx]'
+pip install 'autopack-grn[onnx]'
 
 # GGUF export helpers (converter deps)
-pip install -e '.[gguf]'
+pip install 'autopack-grn[gguf]'
 
 # llama.cpp runtime bindings (llama-cpp-python)
-pip install -e '.[llama]'
+pip install 'autopack-grn[llama]'
 
 # Everything for llama.cpp functionality (GGUF export + runtime)
-pip install -e '.[gguf,llama]'
+pip install 'autopack-grn[gguf,llama]'
 ```
 
 Note: for GGUF and llama.cpp functionality you also need the llama.cpp tools
 (`llama-quantize`, `llama-cli`) available on your `PATH`. You can build the
 vendored copy and export `PATH` as shown in
 [Vendored llama.cpp quick build](#vendored-llamacpp-quick-build).
+
+### From source (dev)
+
+```bash
+pip install -e .
+
+# Optional extras while developing
+pip install -e '.[onnx]'
+pip install -e '.[gguf]'
+pip install -e '.[llama]'
+pip install -e '.[gguf,llama]'
+```
 
 # Building Instructions
 
@@ -222,7 +234,7 @@ autopack auto meta-llama/Llama-3-8B -o out/llama3-gguf \
 
 Hello World (Transformers on CPU):
 ```bash
-pip install -e .
+pip install autopack-grn
 autopack auto sshleifer/tiny-gpt2 -o out/tiny --output-format hf
 python - <<'PY'
 from transformers import AutoTokenizer, AutoModelForCausalLM

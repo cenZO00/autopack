@@ -31,7 +31,15 @@
 
 ## What is autopack?
 
-autopack is a CLI that helps you quantize and package Hugging Face models into multiple useful formats in a single pass, with an option to publish artifacts to the Hub.
+autopack is a CLI that helps you quantize and package Hugging Face models into multiple useful formats in a single pass, with an option to publish artifacts to the Hub. 
+
+You have a 120b llm and want to optimise it so that people (not corpotations with clusters of b200s) can use it on their 8gb 2060? all you need to do is run 
+
+```bash
+autopack auto meta-llama/Llama-3-8B -o out/llama
+```
+
+
 
 ### Why use it?
 
@@ -63,9 +71,23 @@ pip install -e .
 ### Optional extras
 
 ```bash
+# ONNX export support
 pip install -e '.[onnx]'
+
+# GGUF export helpers (converter deps)
+pip install -e '.[gguf]'
+
+# llama.cpp runtime bindings (llama-cpp-python)
 pip install -e '.[llama]'
+
+# Everything for llama.cpp functionality (GGUF export + runtime)
+pip install -e '.[gguf,llama]'
 ```
+
+Note: for GGUF and llama.cpp functionality you also need the llama.cpp tools
+(`llama-quantize`, `llama-cli`) available on your `PATH`. You can build the
+vendored copy and export `PATH` as shown in
+[Vendored llama.cpp quick build](#vendored-llamacpp-quick-build).
 
 # Building Instructions
 

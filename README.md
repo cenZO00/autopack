@@ -36,7 +36,7 @@ autopack is a CLI that helps you quantize and package Hugging Face models into m
 You have a 120b llm and want to optimise it so that people (not corpotations with clusters of b200s) can use it on their 8gb 2060? all you need to do is run 
 
 ```bash
-autopack auto meta-llama/Llama-3-8B -o out/llama
+autopack auto sentence-transformers/all-MiniLM-L6-v2 -o out/llama
 ```
 
 

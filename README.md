@@ -33,7 +33,7 @@
 
 autopack is a CLI that helps you quantize and package Hugging Face models into multiple useful formats in a single pass, with an option to publish artifacts to the Hub. 
 
-You have a 120b llm and want to optimise it so that people (not corpotations with clusters of b200s) can use it on their 8gb 2060? all you need to do is run 
+You have a 120B LLM and want to optimize it so that people (not corporations with clusters of B200s) can use it on their 8GB 2060? All you need to do is run:
 
 ```bash
 autopack auto sentence-transformers/all-MiniLM-L6-v2 -o out/llama
@@ -117,12 +117,12 @@ autopack auto meta-llama/Llama-3-8B -o out/llama3 --output-format hf
 
 Add ONNX and GGUF:
 ```bash
-autopack auto meta-llama/Llama-3-8B -o out/llama3 --output-format hf onnx gguf
+autopack auto meta-llama/Llama-3-8B -o out/llama3 --output-format hf onnx gguf --summary-json --skip-existing
 ```
 
 GGUF only (with default presets Q4_K_M, Q5_K_M, Q8_0):
 ```bash
-autopack auto meta-llama/Llama-3-8B -o out/llama3-gguf --output-format gguf
+autopack auto meta-llama/Llama-3-8B -o out/llama3-gguf --output-format gguf --skip-existing
 ```
 
 Publish to Hub:
@@ -208,6 +208,7 @@ autopack publish <folder> <user_or_org/repo> \
 ## Perplexity Evaluation
 
 - `--eval-dataset` accepts `dataset` or `dataset:config` (e.g., `wikitext-2-raw-v1`)
+- `--eval-text-key` controls which dataset column is used for text (default: `text`)
 - Device selection is automatic (`cuda` if available, else `cpu`)
 - Only CausalLM architectures are supported for perplexity computation
 - Uses a bounded sample count and expects a `text` field in the dataset

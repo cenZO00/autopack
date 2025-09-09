@@ -103,8 +103,10 @@ def export_gguf(
         try:
             venv_dir = os.path.join(output_dir, ".venv")
             venv.create(venv_dir, with_pip=True)
-            pip_executable = os.path.join(venv_dir, "bin", "pip")
-            python_executable = os.path.join(venv_dir, "bin", "python")
+            # Handle Windows vs POSIX venv layout
+            bin_dir = os.path.join(venv_dir, "Scripts") if os.name == "nt" else os.path.join(venv_dir, "bin")
+            pip_executable = os.path.join(bin_dir, "pip")
+            python_executable = os.path.join(bin_dir, "python")
             env_vars = dict(env or os.environ)
             env_vars.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
             env_vars.setdefault("PIP_NO_INPUT", "1")
@@ -151,9 +153,11 @@ def export_gguf(
     subprocess.run(convert_cmd, check=True, text=True, env=env)
 
     if not quant:
-        # Clean up venv and return unquantized path
+        # Clean up venv and any temp snapshot, then return unquantized path
         if venv_dir and os.path.isdir(venv_dir):
             shutil.rmtree(venv_dir, ignore_errors=True)
+        if downloaded_temp_dir and os.path.isdir(downloaded_temp_dir):
+            shutil.rmtree(downloaded_temp_dir, ignore_errors=True)
         return gguf_unquantized
 
     # Run llama.cpp quantizer
@@ -164,28 +168,16 @@ def export_gguf(
     except FileNotFoundError as exc:
         raise RuntimeError("'llama-quantize' not found. Build llama.cpp and ensure build/bin is in PATH.") from exc
 
-    # Clean up unquantized GGUF and venv
+    # Clean up unquantized GGUF, venv, and any temp snapshot
     os.remove(gguf_unquantized)
     if venv_dir and os.path.isdir(venv_dir):
         shutil.rmtree(venv_dir, ignore_errors=True)
+    if downloaded_temp_dir and os.path.isdir(downloaded_temp_dir):
+        shutil.rmtree(downloaded_temp_dir, ignore_errors=True)
 
     return quantized_path
 
 
 
-def export_ggml(
-    model_id_or_path: str,
-    output_dir: str,
-    trust_remote_code: bool = False,
-    revision: Optional[str] = None,
-) -> str:
-    """Export a model to legacy GGML format.
-
-    Note: Upstream llama.cpp has migrated to GGUF. There is no supported HF->GGML
-    conversion path in the vendored version. This function intentionally raises
-    with guidance. If you have a specific GGML conversion tool, integrate it here.
-    """
-    raise RuntimeError(
-        "GGML export is not supported in this version. Use GGUF instead, or provide a custom GGML converter and integrate it into export_ggml()."
-    )
+# No GGML export in this version
 

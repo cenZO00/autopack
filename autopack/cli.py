@@ -1,11 +1,12 @@
 import argparse
 import os
 import sys
+import json
 from typing import List, Optional, Tuple, Dict
 
 from . import __version__
 from .quantize import quantize_to_hf
-from .exporters import export_onnx, export_gguf, export_ggml
+from .exporters import export_onnx, export_gguf
 from .publish import publish_folder_to_hub
 from .evaluation import calculate_perplexity
 from transformers.utils import logging as hf_logging
@@ -36,9 +37,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     a.add_argument(
         "--output-format",
         nargs="+",
-        choices=["hf", "onnx", "gguf", "ggml"],
+        choices=["hf", "onnx", "gguf"],
         default=["hf"],
-        help="One or more output formats to produce (gguf/ggml are opt-in)",
+        help="One or more output formats to produce (gguf is opt-in)",
     )
     a.add_argument(
         "--trust-remote-code",
@@ -54,6 +55,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--eval-dataset",
         default=None,
         help="Optional Hugging Face dataset to run perplexity evaluation on (e.g., wikitext-2-raw-v1)",
+    )
+    a.add_argument(
+        "--eval-text-key",
+        default="text",
+        help="Column name in the eval dataset containing raw text",
     )
     a.add_argument(
         "--gguf-converter",
@@ -82,6 +88,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--gguf-force",
         action="store_true",
         help="Bypass architecture support check for GGUF conversion",
+    )
+    a.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip work for outputs that already exist",
+    )
+    a.add_argument(
+        "--summary-json",
+        action="store_true",
+        help="Write machine-readable summary.json alongside README",
     )
 
     # quantize command
@@ -130,7 +146,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     q.add_argument(
         "--output-format",
         nargs="+",
-        choices=["hf", "onnx", "gguf", "ggml"],
+        choices=["hf", "onnx", "gguf"],
         default=["hf"],
         help="One or more output formats to produce",
     )
@@ -160,6 +176,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--gguf-force",
         action="store_true",
         help="Bypass architecture support check for GGUF conversion",
+    )
+    q.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip work for outputs that already exist",
     )
 
     # publish command
@@ -230,7 +251,7 @@ def _generate_readme(
     lines.append(
         "To load and use these models, you will need the `transformers` library and, for some variants, `bitsandbytes`.\n"
     )
-    lines.append("```bash\npip install transformers bitsandbytes\n```\n\n")
+    lines.append("```bash\npip install transformers accelerate safetensors bitsandbytes\n```\n\n")
 
     for name, out_dir, _ in results:
         relative_path = os.path.relpath(out_dir, output_dir)
@@ -248,12 +269,11 @@ def _generate_readme(
             lines.append("```\n\n")
         else:
             lines.append("```python\n")
-            lines.append("from transformers import AutoTokenizer, AutoModel\n\n")
+            lines.append("from transformers import AutoTokenizer, AutoModelForCausalLM\n\n")
             lines.append(f'model_path = "./{relative_path}"\n\n')
             lines.append("tokenizer = AutoTokenizer.from_pretrained(model_path)\n")
-            # The `trust_remote_code` is important for quanto-quantized models
             lines.append(
-                'model = AutoModel.from_pretrained(model_path, device_map="auto", trust_remote_code=True)\n'
+                'model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto", trust_remote_code=True)\n'
             )
             lines.append("```\n\n")
 
@@ -339,6 +359,7 @@ def run_auto(args: argparse.Namespace) -> int:
                         out_dir,
                         dataset_id,
                         dataset_config or "",
+                        text_key=getattr(args, "eval_text_key", "text"),
                         trust_remote_code=args.trust_remote_code,
                     )
                     perplexities[name] = ppl
@@ -352,12 +373,13 @@ def run_auto(args: argparse.Namespace) -> int:
         onnx_dir = os.path.join(args.output_dir, "onnx")
         os.makedirs(onnx_dir, exist_ok=True)
         try:
-            export_onnx(
-                model_id_or_path=args.model,
-                output_dir=onnx_dir,
-                trust_remote_code=args.trust_remote_code,
-                revision=args.revision,
-            )
+            if not (getattr(args, "skip_existing", False) and os.path.isdir(onnx_dir) and _dir_size(onnx_dir) > 0):
+                export_onnx(
+                    model_id_or_path=args.model,
+                    output_dir=onnx_dir,
+                    trust_remote_code=args.trust_remote_code,
+                    revision=args.revision,
+                )
             size_bytes = _dir_size(onnx_dir)
             results.append(("onnx", onnx_dir, size_bytes))
         except Exception as e:
@@ -389,18 +411,22 @@ def run_auto(args: argparse.Namespace) -> int:
             for quant in quant_list:
                 try:
                     pbar.set_description(f"GGUF {quant}")
-                    gguf_path = export_gguf(
-                        model_id_or_path=source_model_path,
-                        output_dir=gguf_out_dir,
-                        quant=quant,
-                        converter_path=(args.gguf_converter or default_converter_path),
-                        trust_remote_code=args.trust_remote_code,
-                        revision=args.revision,
-                        extra_args=args.gguf_extra_args,
-                        env=env,
-                        isolate_env=not args.gguf_no_isolation,
-                        force=args.gguf_force,
-                    )
+                    expected_file = os.path.join(gguf_out_dir, f"model-{quant}.gguf")
+                    if getattr(args, "skip_existing", False) and os.path.isfile(expected_file):
+                        pass
+                    else:
+                        export_gguf(
+                            model_id_or_path=source_model_path,
+                            output_dir=gguf_out_dir,
+                            quant=quant,
+                            converter_path=(args.gguf_converter or default_converter_path),
+                            trust_remote_code=args.trust_remote_code,
+                            revision=args.revision,
+                            extra_args=args.gguf_extra_args,
+                            env=env,
+                            isolate_env=not args.gguf_no_isolation,
+                            force=args.gguf_force,
+                        )
                     # Use directory size to avoid errors if path is None or if multiple files are produced
                     size_bytes = _dir_size(gguf_out_dir)
                     results.append((f"gguf-{quant}", gguf_out_dir, size_bytes))
@@ -413,19 +439,7 @@ def run_auto(args: argparse.Namespace) -> int:
 
     pbar.close()
 
-    # --- Optional GGML export for auto (opt-in) ---
-    if "ggml" in args.output_format:
-        ggml_dir = os.path.join(args.output_dir, "ggml")
-        os.makedirs(ggml_dir, exist_ok=True)
-        try:
-            export_ggml(
-                model_id_or_path=args.model,
-                output_dir=ggml_dir,
-                trust_remote_code=args.trust_remote_code,
-                revision=args.revision,
-            )
-        except Exception as e:
-            print(f"Skipping GGML export due to an error: {e}")
+    # No GGML export in this version
 
     # Establish baseline size (bf16)
     baseline = next((r for r in results if r[0] == "bf16"), None)
@@ -474,10 +488,33 @@ def run_auto(args: argparse.Namespace) -> int:
             print(f"{name:<14}  {out_dir:<40}  {size_h:>12}  {rel:>9.2f}  {speed:>12.2f}x  {quality:>18}")
     print()
 
-    # Generate README.md
+    # Generate README.md and optional summary.json
     _generate_readme(
         args.model, args.output_dir, results, baseline_size, est_speed, est_quality_drop, perplexities
     )
+    if getattr(args, "summary_json", False):
+        try:
+            summary = []
+            for name, out_dir, sz in results:
+                entry = {
+                    "variant": name,
+                    "output_path": os.path.relpath(out_dir, args.output_dir),
+                    "size_bytes": sz,
+                    "relative_size": (sz / baseline_size) if baseline_size else 1.0,
+                    "estimated_speedup": est_speed.get(name, 1.0),
+                    "estimated_quality_drop": est_quality_drop.get(name, None),
+                }
+                if perplexities:
+                    entry["perplexity"] = perplexities.get(name)
+                summary.append(entry)
+            with open(os.path.join(args.output_dir, "summary.json"), "w") as f:
+                json.dump({
+                    "base_model": args.model,
+                    "results": summary,
+                }, f, indent=2)
+            print(f"Wrote summary JSON at: {os.path.join(args.output_dir, 'summary.json')}")
+        except Exception as e:
+            print(f"Could not write summary.json: {e}")
 
     return 0
 
@@ -490,16 +527,17 @@ def run_quantize(args: argparse.Namespace) -> int:
     # Always produce HF format first when requested
     if "hf" in args.output_format:
         pbar.set_description("HF export")
-        quantize_to_hf(
-            model_id_or_path=args.model,
-            output_dir=args.output_dir,
-            quantization=args.quantization,
-            dtype=args.dtype,
-            device_map=args.device_map,
-            trust_remote_code=args.trust_remote_code,
-            revision=args.revision,
-            prune=args.prune,
-        )
+        if not (getattr(args, "skip_existing", False) and os.path.isdir(args.output_dir) and _dir_size(args.output_dir) > 0):
+            quantize_to_hf(
+                model_id_or_path=args.model,
+                output_dir=args.output_dir,
+                quantization=args.quantization,
+                dtype=args.dtype,
+                device_map=args.device_map,
+                trust_remote_code=args.trust_remote_code,
+                revision=args.revision,
+                prune=args.prune,
+            )
         pbar.update(1)
 
     # Produce ONNX by exporting from the original model id/path (fresh load)
@@ -507,12 +545,13 @@ def run_quantize(args: argparse.Namespace) -> int:
         pbar.set_description("ONNX export")
         onnx_dir = os.path.join(args.output_dir, "onnx")
         os.makedirs(onnx_dir, exist_ok=True)
-        export_onnx(
-            model_id_or_path=args.model,
-            output_dir=onnx_dir,
-            trust_remote_code=args.trust_remote_code,
-            revision=args.revision,
-        )
+        if not (getattr(args, "skip_existing", False) and os.path.isdir(onnx_dir) and _dir_size(onnx_dir) > 0):
+            export_onnx(
+                model_id_or_path=args.model,
+                output_dir=onnx_dir,
+                trust_remote_code=args.trust_remote_code,
+                revision=args.revision,
+            )
         pbar.update(1)
 
     # GGUF export (optional)
@@ -520,31 +559,29 @@ def run_quantize(args: argparse.Namespace) -> int:
         pbar.set_description("GGUF export")
         gguf_dir = os.path.join(args.output_dir, "gguf")
         os.makedirs(gguf_dir, exist_ok=True)
-        export_gguf(
-            model_id_or_path=args.model,
-            output_dir=gguf_dir,
-            trust_remote_code=args.trust_remote_code,
-            revision=args.revision,
-            converter_path=args.gguf_converter,
-            quant=(args.gguf_quant.upper() if isinstance(args.gguf_quant, str) else args.gguf_quant),
-            extra_args=args.gguf_extra_args,
-            isolate_env=not args.gguf_no_isolation,
-            force=args.gguf_force,
-        )
+        quant_arg = (args.gguf_quant.upper() if isinstance(args.gguf_quant, str) else args.gguf_quant)
+        expected_file = None
+        if isinstance(quant_arg, str):
+            expected_file = os.path.join(gguf_dir, f"model-{quant_arg}.gguf")
+        elif quant_arg is None:
+            expected_file = os.path.join(gguf_dir, "model-f16.gguf")
+        if not (getattr(args, "skip_existing", False) and expected_file and os.path.isfile(expected_file)):
+            export_gguf(
+                model_id_or_path=args.model,
+                output_dir=gguf_dir,
+                trust_remote_code=args.trust_remote_code,
+                revision=args.revision,
+                converter_path=args.gguf_converter,
+                quant=quant_arg,
+                extra_args=args.gguf_extra_args,
+                isolate_env=not args.gguf_no_isolation,
+                force=args.gguf_force,
+            )
         pbar.update(1)
 
     pbar.close()
 
-    # GGML export (optional)
-    if "ggml" in args.output_format:
-        ggml_dir = os.path.join(args.output_dir, "ggml")
-        os.makedirs(ggml_dir, exist_ok=True)
-        export_ggml(
-            model_id_or_path=args.model,
-            output_dir=ggml_dir,
-            trust_remote_code=args.trust_remote_code,
-            revision=args.revision,
-        )
+    # No GGML export in this version
 
     return 0
 

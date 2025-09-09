@@ -15,6 +15,7 @@ def calculate_perplexity(
     n_samples: int = 256,
     device: str = "auto",
     trust_remote_code: bool = False,
+    text_key: str = "text",
 ) -> float:
     """Calculate perplexity of a model on a dataset.
 
@@ -34,6 +35,7 @@ def calculate_perplexity(
     model = AutoModelForCausalLM.from_pretrained(
         model_id_or_path, trust_remote_code=trust_remote_code
     ).to(device)
+    model.eval()
     tokenizer = AutoTokenizer.from_pretrained(model_id_or_path, trust_remote_code=trust_remote_code)
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
@@ -44,7 +46,7 @@ def calculate_perplexity(
     dataset = load_dataset(dataset_id, **dataset_kwargs)
     text_list = []
     for sample in dataset.select(range(min(n_samples, len(dataset)))):
-        txt = sample.get("text")
+        txt = sample.get(text_key)
         if txt:
             text_list.append(txt)
 
@@ -69,7 +71,7 @@ def calculate_perplexity(
         target_ids = input_ids.clone()
         target_ids[:, :-trg_len] = -100
 
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = model(input_ids, labels=target_ids)
             neg_log_likelihood = outputs.loss
 

@@ -135,6 +135,11 @@ def quantize_to_hf(
     if quantization in {"bnb-4bit", "bnb-8bit"} and prune and prune > 0.0:
         apply_global_magnitude_pruning(model, prune)
 
+    # Ensure inference mode prior to saving
+    model.eval()
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     # Robust save: try safetensors, fallback to PyTorch if shared tensors error
     try:
         model.save_pretrained(output_dir, safe_serialization=True)

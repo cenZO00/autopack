@@ -3,8 +3,9 @@
     <img src="https://raw.githubusercontent.com/GranulaVision/autopack/refs/heads/main/media/banner.jpg">
   </a>
 
-<h3 align="center">autopack</h3>
+<h3 align="center">autopack</h3> 
 
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/autopack-grn?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/autopack-grn)
   <p align="justify">
     autopack makes your Hugging Face models easy to run, share, and ship. It quantizes once and exports to multiple runtimes, with sensible defaults and an automatic flow that produces a readable summary. It supports HF, ONNX, and GGUF (llama.cpp) formats and can publish to the Hugging Face Hub in one shot.
   </p>

@@ -445,7 +445,7 @@ def run_auto(args: argparse.Namespace) -> int:
     baseline = next((r for r in results if r[0] == "bf16"), None)
     baseline_size = baseline[2] if baseline else max((r[2] for r in results if r[2] > 0), default=1)
 
-    # Estimated speedups vs bf16 baseline (very rough heuristics; actual depends on HW)
+    # Estimated speedups vs bf16 baseline (very rough heuristics for now ; actual depends on HW)
     est_speed = {
         "bf16": 1.00,
         "bnb-8bit": 1.50,
@@ -454,7 +454,7 @@ def run_auto(args: argparse.Namespace) -> int:
         "gguf": 2.80,  # GGUF on CPU can be very fast
     }
 
-    # Estimated quality drop (lower is better, very rough heuristics)
+    # Estimated quality drop (lower is better, very rough heuristics for now )
     est_quality_drop = {
         "bf16": "0.0%",
         "bnb-8bit": "~0.1-0.5%",

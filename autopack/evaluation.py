@@ -1,10 +1,40 @@
 import math
-from typing import Any, Dict, Optional
+import os
+from typing import Any, Dict, Optional, List, Tuple
 
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+import time
+
+
+def _measure_generation_latency(
+    generate_fn,
+    prompt_ids: torch.Tensor,
+    num_warmup: int = 1,
+    num_runs: int = 3,
+) -> Tuple[float, float, int]:
+    """Measure average latency (s) and tokens/s for a generation callable.
+
+    The callable should accept `input_ids` and return generated ids.
+    """
+    # Warmup
+    for _ in range(num_warmup):
+        _ = generate_fn(prompt_ids)
+
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    start = time.perf_counter()
+    total_new_tokens = 0
+    total_new_tokens = 0
+    for _ in range(num_runs):
+        out_ids = generate_fn(prompt_ids)
+        total_new_tokens += max(0, out_ids.shape[1] - prompt_ids.shape[1])
+    end = time.perf_counter()
+    duration = (end - start) / max(1, num_runs)
+    tps = (total_new_tokens / max(1, num_runs)) / max(duration, 1e-9)
+    avg_new_tokens = int(round(total_new_tokens / max(1, num_runs)))
+    return duration, tps, avg_new_tokens
 
 
 def calculate_perplexity(
@@ -82,3 +112,186 @@ def calculate_perplexity(
 
     ppl = torch.exp(torch.stack(nlls).mean())
     return ppl.item()
+
+
+def benchmark_hf(
+    model_id_or_path: str,
+    prompt: str = "Hello world",
+    max_new_tokens: int = 64,
+    device: str = "auto",
+    trust_remote_code: bool = False,
+    num_warmup: int = 1,
+    num_runs: int = 3,
+) -> Dict[str, Any]:
+    """Benchmark Transformers (HF) model generation latency and throughput."""
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id_or_path, trust_remote_code=trust_remote_code)
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id_or_path, trust_remote_code=trust_remote_code
+    ).to(device)
+    model.eval()
+
+    prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+
+    def _gen(input_ids: torch.Tensor) -> torch.Tensor:
+        with torch.inference_mode():
+            out = model.generate(input_ids, max_new_tokens=max_new_tokens)
+        return out
+
+    latency_s, tokens_per_s, new_tokens = _measure_generation_latency(_gen, prompt_ids, num_warmup, num_runs)
+
+    max_mem = None
+    if device == "cuda":
+        try:
+            max_mem = torch.cuda.max_memory_allocated()
+            torch.cuda.reset_max_memory_allocated()
+        except Exception:
+            pass
+
+    return {
+        "backend": "hf",
+        "latency_s": latency_s,
+        "tokens_per_s": tokens_per_s,
+        "new_tokens": new_tokens,
+        "device": device,
+        "max_memory_bytes": max_mem,
+    }
+
+
+def benchmark_onnx(
+    model_dir: str,
+    prompt: str = "Hello world",
+    max_new_tokens: int = 64,
+    device: str = "auto",
+    num_warmup: int = 1,
+    num_runs: int = 3,
+) -> Dict[str, Any]:
+    """Benchmark ONNXRuntime model (exported via optimum) if available."""
+    try:
+        from optimum.onnxruntime import ORTModelForCausalLM
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("ONNX benchmarking requires 'optimum[onnxruntime]'.") from exc
+
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = ORTModelForCausalLM.from_pretrained(model_dir)
+    model.eval()
+
+    prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids
+
+    def _gen(input_ids: torch.Tensor) -> torch.Tensor:
+        # ORT model expects CPU tensors; generation API mirrors HF
+        with torch.inference_mode():
+            out = model.generate(input_ids, max_new_tokens=max_new_tokens)
+        return out
+
+    latency_s, tokens_per_s, new_tokens = _measure_generation_latency(_gen, prompt_ids, num_warmup, num_runs)
+    return {
+        "backend": "onnx",
+        "latency_s": latency_s,
+        "tokens_per_s": tokens_per_s,
+        "new_tokens": new_tokens,
+        "device": device,
+        "max_memory_bytes": None,
+    }
+
+
+def benchmark_gguf(
+    gguf_model_path: str,
+    prompt: str = "Hello world",
+    max_new_tokens: int = 64,
+    llama_cli_path: Optional[str] = None,
+    num_warmup: int = 1,
+    num_runs: int = 3,
+) -> Dict[str, Any]:
+    """Benchmark llama.cpp via subprocess using llama-cli if available.
+
+    We call llama-cli for generation and time the process wall-clock. Tokens/s are parsed from stdout when available,
+    otherwise computed from elapsed time and token count.
+    """
+    import subprocess
+    import shlex
+
+    # Resolve llama-cli
+    if llama_cli_path is None:
+        # Try vendored build path first
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidate = os.path.join(repo_root, "third_party", "llama.cpp", "build", "bin", "llama-cli")
+        llama_cli_path = candidate if os.path.isfile(candidate) else "llama-cli"
+
+    def _run_once() -> Tuple[float, int, Optional[float]]:
+        cmd = [
+            llama_cli_path,
+            "-m",
+            gguf_model_path,
+            "-p",
+            prompt,
+            "-n",
+            str(max_new_tokens),
+        ]
+        t0 = time.perf_counter()
+        try:
+            proc = subprocess.run(cmd, capture_output=True, check=True, text=True)
+            stdout = proc.stdout
+        except Exception as exc:
+            raise RuntimeError(f"Failed to run llama-cli: {exc}")
+        dt = time.perf_counter() - t0
+        # Try to parse tokens/s from stdout footer lines like: "eval time ... tok/s"
+        parsed_tps = None
+        for line in stdout.splitlines()[-10:]:
+            if "tok/s" in line:
+                # crude parse: take last float before 'tok/s'
+                try:
+                    parts = line.replace(",", " ").split()
+                    for i, p in enumerate(parts):
+                        if p.startswith("tok/s") or p.endswith("tok/s"):
+                            # previous numeric token may be the tps
+                            for j in range(i - 1, -1, -1):
+                                try:
+                                    parsed_tps = float(parts[j])
+                                    break
+                                except ValueError:
+                                    continue
+                            break
+                except Exception:
+                    pass
+                if parsed_tps is not None:
+                    break
+        return dt, max_new_tokens, parsed_tps
+
+    # Warmup
+    for _ in range(num_warmup):
+        _run_once()
+    # Timed runs
+    total_dt = 0.0
+    total_tokens = 0
+    parsed_tps_values: List[float] = []
+    for _ in range(num_runs):
+        dt, num_tokens, parsed_tps = _run_once()
+        total_dt += dt
+        total_tokens += num_tokens
+        if parsed_tps is not None:
+            parsed_tps_values.append(parsed_tps)
+
+    avg_dt = total_dt / max(1, num_runs)
+    computed_tps = (total_tokens / max(1, num_runs)) / max(avg_dt, 1e-9)
+    tokens_per_s = parsed_tps_values[-1] if parsed_tps_values else computed_tps
+
+    return {
+        "backend": "gguf",
+        "latency_s": avg_dt,
+        "tokens_per_s": tokens_per_s,
+        "new_tokens": max_new_tokens,
+        "device": "cpu",
+        "max_memory_bytes": None,
+    }

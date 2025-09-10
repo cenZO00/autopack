@@ -25,9 +25,16 @@ _DTYPE_MAP = {
 }
 
 
-def _get_auto_model_class(model_id_or_path: str, revision: Optional[str] = None) -> Type[AutoModel]:
+def _get_auto_model_class(
+    model_id_or_path: str,
+    revision: Optional[str] = None,
+    trust_remote_code: bool = False,
+    local_files_only: bool = False,
+) -> Type[AutoModel]:
     """Inspect model config to determine which AutoModel class to use."""
-    config = AutoConfig.from_pretrained(model_id_or_path, revision=revision)
+    config = AutoConfig.from_pretrained(
+        model_id_or_path, revision=revision, trust_remote_code=trust_remote_code, local_files_only=local_files_only
+    )
     archs = config.architectures
     if not archs:
         # Fallback for models with no architecture specified (rare)
@@ -80,6 +87,7 @@ def quantize_to_hf(
     trust_remote_code: bool = False,
     revision: Optional[str] = None,
     prune: float = 0.0,
+    local_files_only: bool = False,
 ) -> str:
     """Load a model with bitsandbytes quantization and save in HF format.
 
@@ -88,17 +96,42 @@ def quantize_to_hf(
     if quantization not in {"bnb-4bit", "bnb-8bit", "int8-dynamic", "none"}:
         raise ValueError("quantization must be one of: 'bnb-4bit', 'bnb-8bit', 'int8-dynamic', 'none'")
 
+    # Detect if the source model is already pre-quantized with a non-BitsAndBytes
+    # quantizer (e.g., MxFP4). If so, avoid passing a BitsAndBytesConfig which
+    # would conflict with the existing quantization config.
+    try:
+        src_config = AutoConfig.from_pretrained(
+            model_id_or_path,
+            revision=revision,
+            trust_remote_code=trust_remote_code,
+            local_files_only=local_files_only,
+        )
+        existing_qc = getattr(src_config, "quantization_config", None)
+        is_pre_quantized = bool(existing_qc) and not isinstance(existing_qc, BitsAndBytesConfig)
+    except Exception:
+        src_config = None
+        is_pre_quantized = False
+
     quant_config = _build_bnb_config(quantization, dtype)
+    if is_pre_quantized and quant_config is not None:
+        logger.warning(
+            "Detected existing non-BitsAndBytes quantization in source model; "
+            "skipping BitsAndBytes quantization and loading as-is."
+        )
+        quant_config = None
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_id_or_path,
         revision=revision,
         use_fast=True,
         trust_remote_code=trust_remote_code,
+        local_files_only=local_files_only,
     )
 
     if quantization == "int8-dynamic":
-        AutoModelClass = _get_auto_model_class(model_id_or_path, revision)
+        AutoModelClass = _get_auto_model_class(
+            model_id_or_path, revision, trust_remote_code=trust_remote_code, local_files_only=local_files_only
+        )
         # Load in float on CPU, then apply PyTorch dynamic quantization to Linear layers
         model = AutoModelClass.from_pretrained(
             model_id_or_path,
@@ -106,28 +139,35 @@ def quantize_to_hf(
             trust_remote_code=trust_remote_code,
             device_map="cpu",
             dtype=torch.float32,
+            local_files_only=local_files_only,
         )
         if prune and prune > 0.0:
             apply_global_magnitude_pruning(model, prune)
         model = tq.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
     elif quant_config is not None:
-        AutoModelClass = _get_auto_model_class(model_id_or_path, revision)
+        AutoModelClass = _get_auto_model_class(
+            model_id_or_path, revision, trust_remote_code=trust_remote_code, local_files_only=local_files_only
+        )
         model = AutoModelClass.from_pretrained(
             model_id_or_path,
             revision=revision,
             trust_remote_code=trust_remote_code,
             device_map=device_map,
             quantization_config=quant_config,
+            local_files_only=local_files_only,
         )
     else:
         torch_dtype = _DTYPE_MAP.get(dtype)
-        AutoModelClass = _get_auto_model_class(model_id_or_path, revision)
+        AutoModelClass = _get_auto_model_class(
+            model_id_or_path, revision, trust_remote_code=trust_remote_code, local_files_only=local_files_only
+        )
         model = AutoModelClass.from_pretrained(
             model_id_or_path,
             revision=revision,
             trust_remote_code=trust_remote_code,
             device_map=device_map,
             dtype=torch_dtype,
+            local_files_only=local_files_only,
         )
         if prune and prune > 0.0:
             apply_global_magnitude_pruning(model, prune)

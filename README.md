@@ -37,7 +37,7 @@ autopack is a CLI that helps you quantize and package Hugging Face models into m
 You have a 120B LLM and want to optimize it so that people (not corporations with clusters of B200s) can use it on their 8GB 2060? All you need to do is run:
 
 ```bash
-autopack auto sentence-transformers/all-MiniLM-L6-v2 -o out/llama
+autopack sentence-transformers/all-MiniLM-L6-v2
 ```
 
 
@@ -113,17 +113,17 @@ python -m build
 ## Quickstart
 
 ```bash
-autopack auto meta-llama/Llama-3-8B -o out/llama3 --output-format hf
+autopack meta-llama/Llama-3-8B --output-format hf
 ```
 
 Add ONNX and GGUF:
 ```bash
-autopack auto meta-llama/Llama-3-8B -o out/llama3 --output-format hf onnx gguf --summary-json --skip-existing
+autopack meta-llama/Llama-3-8B --output-format hf onnx gguf --summary-json --skip-existing
 ```
 
 GGUF only (with default presets Q4_K_M, Q5_K_M, Q8_0):
 ```bash
-autopack auto meta-llama/Llama-3-8B -o out/llama3-gguf --output-format gguf --skip-existing
+autopack meta-llama/Llama-3-8B --output-format gguf --skip-existing
 ```
 
 Publish to Hub:
@@ -141,23 +141,28 @@ autopack publish out/llama3-4bit your-username/llama3-4bit --private \
 Run common HF quantization variants and optional ONNX/GGUF exports in one go, with a summary table and generated README in the output folder.
 
 ```bash
-autopack auto <model_id_or_path> -o <out_dir> \
+autopack [auto] <model_id_or_path> [-o <out_dir>] \
   --output-format hf [onnx] [gguf] \
   [--eval-dataset <dataset>[::<config>]] \
-  [--revision <rev>] [--trust-remote-code]
+  [--revision <rev>] [--trust-remote-code] [--device auto|cpu|cuda] \
+  [--no-bench] [--bench-prompt "..."] [--bench-max-new-tokens 16] \
+  [--bench-warmup 0] [--bench-runs 1]
 ```
 
 Key points:
 - Default HF variants: bnb-4bit, bnb-8bit, int8-dynamic, bf16
 - Add ONNX and/or GGUF via `--output-format`
+- If `-o/--output-dir` is omitted, the output folder defaults to the last path segment of the model id/path (e.g., `user/model` -> `model`).
+- Benchmarking is enabled by default in `auto`; use `--no-bench` to disable.
 - If `--eval-dataset` is provided, perplexity is computed for each HF variant
+- If benchmarking is enabled, autopack measures actual Tokens/s per backend and replaces heuristic speedups with real Tokens/s and speedup vs bf16 in the summary and the generated README.
 
 ### quantize
 
 Produce specific formats with a chosen quantization strategy.
 
 ```bash
-autopack quantize <model_id_or_path> -o <out_dir> \
+autopack quantize <model_id_or_path> [-o <out_dir>] \
   --output-format hf [onnx] [gguf] \
   [--quantization bnb-4bit|bnb-8bit|int8-dynamic|none] \
   [--dtype auto|float16|bfloat16|float32] \
@@ -174,6 +179,22 @@ autopack publish <folder> <user_or_org/repo> \
   [--private] [--token $HUGGINGFACE_HUB_TOKEN] \
   [--branch <rev>] [--commit-message "..."] [--no-create]
 ```
+
+### bench
+
+Run standalone benchmarks on existing models/artifacts.
+
+```bash
+autopack bench <target> \
+  --backend hf [onnx] [gguf] \
+  [--prompt "Hello"] [--max-new-tokens 64] \
+  [--device auto] [--num-warmup 1] [--num-runs 3] \
+  [--trust-remote-code] [--llama-cli /path/to/llama-cli]
+```
+
+Notes:
+- For HF, `target` can be a Hub id or local folder. For ONNX, pass the exported folder. For GGUF, pass a `.gguf` file or a folder containing one.
+- ONNX benchmarking requires `optimum[onnxruntime]`. GGUF benchmarking requires `llama-cli`.
 
 ## Common Options
 
@@ -218,30 +239,35 @@ autopack publish <folder> <user_or_org/repo> \
 
 CPU-friendly int8 dynamic with pruning:
 ```bash
-autopack quantize meta-llama/Llama-3-8B -o out/llama3-cpu \
+autopack quantize meta-llama/Llama-3-8B \
   --output-format hf --quantization int8-dynamic --prune 0.2 --device-map cpu
 ```
 
 BF16 only (no quantization):
 ```bash
-autopack quantize meta-llama/Llama-3-8B -o out/llama3-bf16 \
+autopack quantize meta-llama/Llama-3-8B \
   --output-format hf --quantization none --dtype bfloat16
 ```
 
 Override GGUF presets:
 ```bash
-autopack auto meta-llama/Llama-3-8B -o out/llama3-gguf \
+autopack meta-llama/Llama-3-8B \
   --output-format gguf --gguf-quant Q5_K_M Q8_0
+```
+
+Auto with benchmarking (reports Tokens/s and real speedup vs bf16):
+```bash
+autopack sshleifer/tiny-gpt2 --output-format hf
 ```
 
 Hello World (Transformers on CPU):
 ```bash
 pip install autopack-grn
-autopack auto sshleifer/tiny-gpt2 -o out/tiny --output-format hf
+autopack sshleifer/tiny-gpt2 --output-format hf
 python - <<'PY'
 from transformers import AutoTokenizer, AutoModelForCausalLM
-tok = AutoTokenizer.from_pretrained('out/tiny/bf16')
-m   = AutoModelForCausalLM.from_pretrained('out/tiny/bf16', device_map='cpu')
+tok = AutoTokenizer.from_pretrained('tiny-gpt2/bf16')
+m   = AutoModelForCausalLM.from_pretrained('tiny-gpt2/bf16', device_map='cpu')
 ids = tok('Hello world', return_tensors='pt').input_ids
 out = m.generate(ids, max_new_tokens=8)
 print(tok.decode(out[0]))
@@ -250,8 +276,8 @@ PY
 
 Hello World (GGUF with llama.cpp):
 ```bash
-autopack auto sshleifer/tiny-gpt2 -o out/tiny-gguf --output-format gguf
-./third_party/llama.cpp/build/bin/llama-cli -m out/tiny-gguf/gguf/model-Q4_K_M.gguf -p "Hello world" -n 16
+autopack sshleifer/tiny-gpt2 --output-format gguf
+./third_party/llama.cpp/build/bin/llama-cli -m tiny-gpt2/gguf/model-Q4_K_M.gguf -p "Hello world" -n 16
 ```
 
 ## Vendored llama.cpp quick build

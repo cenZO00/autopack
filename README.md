@@ -325,6 +325,26 @@ Generates HF variants (4-bit, 8-bit, int8-dynamic, bf16) and prints a summary; G
 
 autopack will create multiple useful presets by default (Q4_K_M, Q5_K_M, Q8_0).
 
+## Large models
+
+For very large models (tens of GBs), prefer a minimal, resumable flow:
+
+- **Single variant**: use `--hf-variant bf16` (or another) to avoid multiple loads
+- **Avoid extra runs**: add `--no-bench`
+- **Resume-friendly**: keep `--skip-existing`
+- **CPU-safe**: add `--device cpu` to skip GPU-only paths
+
+Examples:
+```bash
+# BF16 only, no benchmarking, resume if partial outputs exist
+autopack user/model-giant --output-format hf \
+  --hf-variant bf16 --no-bench --skip-existing
+
+# CPU-focused subset
+autopack user/model-giant --output-format hf \
+  --hf-variants bf16 int8-dynamic --device cpu --no-bench --skip-existing
+```
+
 ---
 
 License: Apache-2.0

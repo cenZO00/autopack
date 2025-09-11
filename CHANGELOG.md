@@ -1,4 +1,23 @@
 # Changelog
+
+## [0.1.3.2] - 2025-09-10
+
+### Added
+- `--hf-variant` flag for single-variant runs (convenience alias for `--hf-variants <one>`).
+- `--hf-variants` flag to limit which HF variants to produce in `auto`.
+- Auto-detection of pre-quantized models (e.g., MxFP4) to skip conflicting BitsAndBytes variants.
+- Model resolution to local cache once to avoid repeated downloads for large models.
+- Memory cleanup between variants to free RAM/VRAM after each save.
+
+### Changed
+- `auto` now resolves the model to a local snapshot and reuses it for all variants.
+- Pre-quantized models automatically skip bnb-4bit and bnb-8bit variants to avoid conflicts.
+
+### Fixed
+- Prevent quantization config conflicts when loading pre-quantized models.
+
+[0.1.3.2]: https://github.com/GranulaVision/autopack/releases/tag/v0.1.3.2
+
 ## [0.1.3.1] - 2025-09-10
 
 ### Added

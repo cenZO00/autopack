@@ -146,7 +146,9 @@ autopack [auto] <model_id_or_path> [-o <out_dir>] \
   [--eval-dataset <dataset>[::<config>]] \
   [--revision <rev>] [--trust-remote-code] [--device auto|cpu|cuda] \
   [--no-bench] [--bench-prompt "..."] [--bench-max-new-tokens 16] \
-  [--bench-warmup 0] [--bench-runs 1]
+  [--bench-warmup 0] [--bench-runs 1] \
+  [--hf-variant bnb-4bit|bnb-8bit|int8-dynamic|bf16] \
+  [--hf-variants bnb-4bit bnb-8bit int8-dynamic bf16]
 ```
 
 Key points:
@@ -156,6 +158,7 @@ Key points:
 - Benchmarking is enabled by default in `auto`; use `--no-bench` to disable.
 - If `--eval-dataset` is provided, perplexity is computed for each HF variant
 - If benchmarking is enabled, autopack measures actual Tokens/s per backend and replaces heuristic speedups with real Tokens/s and speedup vs bf16 in the summary and the generated README.
+- For very large models, use `--hf-variant bf16` (single) or `--hf-variants bf16 int8-dynamic` (subset) to reduce loads.
 
 ### quantize
 
@@ -236,6 +239,16 @@ Notes:
 - Uses a bounded sample count and expects a `text` field in the dataset
 
 ## More Examples
+
+Single-variant run (bf16 only):
+```bash
+autopack meta-llama/Llama-3-8B --output-format hf --hf-variant bf16
+```
+
+Subset of variants:
+```bash
+autopack meta-llama/Llama-3-8B --output-format hf --hf-variants bf16 int8-dynamic
+```
 
 CPU-friendly int8 dynamic with pruning:
 ```bash

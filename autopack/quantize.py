@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Optional, Type
+import gc
 
 import logging
 import torch
@@ -148,11 +149,15 @@ def quantize_to_hf(
         AutoModelClass = _get_auto_model_class(
             model_id_or_path, revision, trust_remote_code=trust_remote_code, local_files_only=local_files_only
         )
+        # If user requested CPU device map, force CPU to avoid CUDA allocations from BnB/MxFP4 integrations
+        effective_device_map = device_map
+        if isinstance(effective_device_map, str) and effective_device_map.lower() == "cpu":
+            effective_device_map = "cpu"
         model = AutoModelClass.from_pretrained(
             model_id_or_path,
             revision=revision,
             trust_remote_code=trust_remote_code,
-            device_map=device_map,
+            device_map=effective_device_map,
             quantization_config=quant_config,
             local_files_only=local_files_only,
         )
@@ -161,11 +166,15 @@ def quantize_to_hf(
         AutoModelClass = _get_auto_model_class(
             model_id_or_path, revision, trust_remote_code=trust_remote_code, local_files_only=local_files_only
         )
+        # Respect explicit CPU request; avoids CUDA allocations during dequant of pre-quantized models
+        effective_device_map = device_map
+        if isinstance(effective_device_map, str) and effective_device_map.lower() == "cpu":
+            effective_device_map = "cpu"
         model = AutoModelClass.from_pretrained(
             model_id_or_path,
             revision=revision,
             trust_remote_code=trust_remote_code,
-            device_map=device_map,
+            device_map=effective_device_map,
             dtype=torch_dtype,
             local_files_only=local_files_only,
         )
@@ -197,6 +206,17 @@ def quantize_to_hf(
             # Save config
             model.config.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
+    # Proactively free memory to avoid OOM across sequential variants
+    try:
+        del model
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    gc.collect()
     return output_dir
 
 

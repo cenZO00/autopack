@@ -10,6 +10,8 @@ from .exporters import export_onnx, export_gguf
 from .publish import publish_folder_to_hub
 from .evaluation import calculate_perplexity, benchmark_hf, benchmark_onnx, benchmark_gguf
 from transformers.utils import logging as hf_logging
+from huggingface_hub import snapshot_download
+from transformers import AutoConfig, BitsAndBytesConfig
 from tqdm import tqdm
 
 
@@ -111,6 +113,19 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     a.add_argument("--bench-max-new-tokens", type=int, default=16, help="Max new tokens for benchmarking (auto)")
     a.add_argument("--bench-warmup", type=int, default=0, help="Number of warmup runs for benchmarking (auto)")
     a.add_argument("--bench-runs", type=int, default=1, help="Number of timed runs for benchmarking (auto)")
+    a.add_argument(
+        "--hf-variants",
+        nargs="+",
+        choices=["bnb-4bit", "bnb-8bit", "int8-dynamic", "bf16"],
+        default=None,
+        help="Limit which HF variants to produce (default: all)",
+    )
+    a.add_argument(
+        "--hf-variant",
+        choices=["bnb-4bit", "bnb-8bit", "int8-dynamic", "bf16"],
+        default=None,
+        help="Produce a single HF variant (convenience alias for --hf-variants <one>)",
+    )
 
     # quantize command
     q = subparsers.add_parser("quantize", help="Quantize a model and export in chosen formats")
@@ -365,12 +380,49 @@ def _dir_size(path: str) -> int:
 
 def run_auto(args: argparse.Namespace) -> int:
     os.makedirs(args.output_dir, exist_ok=True)
-    variants: List[Tuple[str, dict]] = [
-        ("bnb-4bit", {"quantization": "bnb-4bit", "dtype": "bfloat16", "device_map": "auto"}),
-        ("bnb-8bit", {"quantization": "bnb-8bit", "dtype": "auto", "device_map": "auto"}),
-        ("int8-dynamic", {"quantization": "int8-dynamic", "dtype": "float32", "device_map": "cpu"}),
-        ("bf16", {"quantization": "none", "dtype": "bfloat16", "device_map": "auto"}),
-    ]
+
+    # Derive HF variant plan based on requested device preference.
+    # - On CPU, skip BitsAndBytes variants (GPU-only) and force device_map="cpu".
+    # - On CUDA, keep the default mix with device_map="auto".
+    # - On auto, keep the default mix.
+    device_pref = getattr(args, "device", "auto")
+    # Detect pre-quantized models to skip BNB variants
+    is_pre_quantized = False
+    try:
+        cfg = AutoConfig.from_pretrained(
+            args.model,
+            revision=args.revision,
+            trust_remote_code=args.trust_remote_code,
+        )
+        existing_qc = getattr(cfg, "quantization_config", None)
+        is_pre_quantized = bool(existing_qc) and not isinstance(existing_qc, BitsAndBytesConfig)
+    except Exception:
+        pass
+
+    # Base variants
+    if device_pref == "cpu":
+        base_variants: List[Tuple[str, dict]] = [
+            ("int8-dynamic", {"quantization": "int8-dynamic", "dtype": "float32", "device_map": "cpu"}),
+            ("bf16", {"quantization": "none", "dtype": "bfloat16", "device_map": "cpu"}),
+        ]
+    else:
+        base_variants: List[Tuple[str, dict]] = [
+            ("bnb-4bit", {"quantization": "bnb-4bit", "dtype": "bfloat16", "device_map": "auto"}),
+            ("bnb-8bit", {"quantization": "bnb-8bit", "dtype": "auto", "device_map": "auto"}),
+            ("int8-dynamic", {"quantization": "int8-dynamic", "dtype": "float32", "device_map": "cpu"}),
+            ("bf16", {"quantization": "none", "dtype": "bfloat16", "device_map": "auto"}),
+        ]
+
+    # Filter by --hf-variants if provided
+    if getattr(args, "hf_variants", None):
+        wanted = set(args.hf_variants)
+        base_variants = [(n, p) for (n, p) in base_variants if n in wanted]
+
+    # Auto-skip BNB variants for pre-quantized models
+    if is_pre_quantized:
+        base_variants = [(n, p) for (n, p) in base_variants if n not in {"bnb-4bit", "bnb-8bit"}]
+
+    variants: List[Tuple[str, dict]] = base_variants
 
     results = []
     perplexities: Dict[str, float] = {}
@@ -388,6 +440,15 @@ def run_auto(args: argparse.Namespace) -> int:
 
     pbar = tqdm(total=total_steps, desc="autopack", unit="step", disable=(total_steps == 0))
 
+    # Resolve model to a local snapshot once to avoid repeated downloads for large models
+    source_model = args.model
+    try:
+        if not os.path.isdir(args.model):
+            pbar.set_description("Resolve model cache")
+            source_model = snapshot_download(repo_id=args.model, revision=args.revision)
+    except Exception:
+        source_model = args.model
+
     # --- Run HF variants (opt-in for auto) ---
     if "hf" in args.output_format:
         for name, params in variants:
@@ -395,13 +456,15 @@ def run_auto(args: argparse.Namespace) -> int:
             out_dir = os.path.join(args.output_dir, name)
             os.makedirs(out_dir, exist_ok=True)
             quantize_to_hf(
-                model_id_or_path=args.model,
+                model_id_or_path=source_model,
                 output_dir=out_dir,
                 quantization=params["quantization"],
                 dtype=params["dtype"],
                 device_map=params["device_map"],
                 trust_remote_code=args.trust_remote_code,
                 revision=args.revision,
+                # Hint downstream loader to avoid accidental CUDA use in integrations
+                local_files_only=True,
             )
             size_bytes = _dir_size(out_dir)
             results.append((name, out_dir, size_bytes))
@@ -436,7 +499,7 @@ def run_auto(args: argparse.Namespace) -> int:
         try:
             if not (getattr(args, "skip_existing", False) and os.path.isdir(onnx_dir) and _dir_size(onnx_dir) > 0):
                 export_onnx(
-                    model_id_or_path=args.model,
+                    model_id_or_path=source_model,
                     output_dir=onnx_dir,
                     trust_remote_code=args.trust_remote_code,
                     revision=args.revision,
@@ -883,6 +946,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             default_out = _derive_output_dir(getattr(args, "model", getattr(args, "target", "model")))
             # For auto, keep variants under the derived folder directly
             setattr(args, "output_dir", default_out)
+    # Normalize single-variant flag into variants list
+    if getattr(args, "command", None) == "auto":
+        if getattr(args, "hf_variant", None) and not getattr(args, "hf_variants", None):
+            setattr(args, "hf_variants", [args.hf_variant])
     # Enable verbose warnings from Transformers when requested
     if getattr(args, "verbose", False):
         hf_logging.set_verbosity_warning()

@@ -297,6 +297,19 @@ def quantize_to_hf(
             # For bnb and none paths, optionally prune after load above. For int8-dynamic we already pruned before quant.
             if quantization in {"bnb-4bit", "bnb-8bit"} and prune and prune > 0.0:
                 apply_global_magnitude_pruning(model, prune)
+        except Exception as e:
+            pbar.close()
+            # Clean up any partially loaded model
+            if model is not None:
+                try:
+                    del model
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
+                except Exception:
+                    pass
+            raise RuntimeError(f"Failed to load model: {e}")
+        
         pbar.update(1)
 
         pbar.set_description(f"Applying quantization...")
@@ -342,11 +355,11 @@ def quantize_to_hf(
         
         pbar.set_description(f"Completed!")
         pbar.close()
-        
+
     except Exception as e:
         pbar.close()
         # Clean up any partially loaded model
-        if model is not None:
+        if 'model' in locals() and model is not None:
             try:
                 del model
                 if torch.cuda.is_available():
@@ -354,7 +367,7 @@ def quantize_to_hf(
                 gc.collect()
             except Exception:
                 pass
-        raise RuntimeError(f"Failed to load model: {e}")
+        raise RuntimeError(f"Quantization failed: {e}")
 
     return output_dir
 

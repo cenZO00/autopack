@@ -220,16 +220,25 @@ class QuantizeArgs:
 
 def _build_bnb_config(quantization: str, dtype: str) -> Optional[BitsAndBytesConfig]:
     compute_dtype = _DTYPE_MAP.get(dtype)
+    # Guard against unsupported compute dtypes for BnB (expects fp16/bf16)
+    if compute_dtype not in (torch.float16, torch.bfloat16, None):
+        compute_dtype = None
+
     if quantization == "bnb-4bit":
+        # Prefer fp16 compute on CUDA for better kernel throughput on consumer GPUs.
+        default_compute = torch.float16 if torch.cuda.is_available() else torch.bfloat16
         return BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=compute_dtype or torch.bfloat16,
+            bnb_4bit_use_double_quant=False,
+            bnb_4bit_compute_dtype=compute_dtype or default_compute,
         )
     if quantization == "bnb-8bit":
+        # Set sane defaults to avoid CPU offload and keep thresholds explicit
         return BitsAndBytesConfig(
             load_in_8bit=True,
+            llm_int8_threshold=6.0,
+            llm_int8_enable_fp32_cpu_offload=False,
         )
     return None
 

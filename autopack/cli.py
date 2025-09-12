@@ -139,6 +139,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Enable memory-safe mode (process one variant at a time with aggressive cleanup)",
     )
+    a.add_argument(
+        "--skip-int8-dynamic",
+        action="store_true",
+        help="Skip int8-dynamic quantization (requires more memory than other variants)",
+    )
 
     # quantize command
     q = subparsers.add_parser("quantize", help="Quantize a model and export in chosen formats")
@@ -435,6 +440,30 @@ def run_auto(args: argparse.Namespace) -> int:
     if is_pre_quantized:
         base_variants = [(n, p) for (n, p) in base_variants if n not in {"bnb-4bit", "bnb-8bit"}]
 
+    # Skip int8-dynamic if requested (memory-intensive)
+    if getattr(args, "skip_int8_dynamic", False):
+        base_variants = [(n, p) for (n, p) in base_variants if n != "int8-dynamic"]
+        print("Skipping int8-dynamic quantization (memory-intensive)")
+    
+    # Auto-skip int8-dynamic for large models when memory is limited
+    if not getattr(args, "skip_int8_dynamic", False):
+        try:
+            import psutil
+            available_gb = psutil.virtual_memory().available / (1024**3)
+            # If less than 20GB available, skip int8-dynamic for 7B+ models
+            if available_gb < 20.0:
+                # Check if this looks like a large model (7B+)
+                try:
+                    from .quantize import _get_model_size_estimate
+                    estimated_size = _get_model_size_estimate(args.model, local_files_only=False, quantization="int8-dynamic")
+                    if estimated_size > 6.0:
+                        base_variants = [(n, p) for (n, p) in base_variants if n != "int8-dynamic"]
+                        print(f"Auto-skipping int8-dynamic quantization (requires ~{estimated_size:.1f}GB, only {available_gb:.1f}GB available)")
+                except Exception:
+                    pass  # If we can't estimate, continue anyway
+        except ImportError:
+            pass  # psutil not available, continue anyway
+
     variants: List[Tuple[str, dict]] = base_variants
 
     results = []
@@ -451,7 +480,14 @@ def run_auto(args: argparse.Namespace) -> int:
         quant_list = args.gguf_quant if args.gguf_quant else ["Q4_K_M", "Q5_K_M", "Q8_0"]
         total_steps += len(quant_list)
 
-    pbar = tqdm(total=total_steps, desc="autopack", unit="step", disable=(total_steps == 0))
+    pbar = tqdm(
+        total=total_steps, 
+        desc="autopack", 
+        unit="variant", 
+        disable=(total_steps == 0),
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+        ncols=100
+    )
 
     # Resolve model to a local snapshot once to avoid repeated downloads for large models
     source_model = args.model
@@ -966,6 +1002,13 @@ def run_bench(args: argparse.Namespace) -> int:
 def main(argv: Optional[List[str]] = None) -> int:
     # Reduce noisy logs by default; allow opt-in via --verbose on any subcommand
     hf_logging.set_verbosity_error()
+    
+    # Suppress transformers progress bars globally
+    try:
+        from .quantize import _suppress_transformers_progress
+        _suppress_transformers_progress()
+    except Exception:
+        pass
     # If user provided args without a subcommand, default to 'auto',
     # but do not hijack global flags like --help/-h/--version or when the first
     # token is itself a flag (e.g., `autopack --version`).

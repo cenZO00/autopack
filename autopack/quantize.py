@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional, Type
 import gc
-
+import psutil
 import logging
 import torch
 import torch.quantization as tq
@@ -16,6 +16,36 @@ from transformers import (
 from .prune import apply_global_magnitude_pruning
 
 logger = logging.getLogger(__name__)
+
+
+def _check_memory_availability(required_gb: float = 8.0) -> bool:
+    """Check if there's enough available memory to load a model."""
+    try:
+        available_memory = psutil.virtual_memory().available / (1024**3)  # Convert to GB
+        return available_memory >= required_gb
+    except Exception:
+        return True  # If we can't check, assume it's okay
+
+
+def _get_model_size_estimate(model_id_or_path: str, local_files_only: bool = False) -> float:
+    """Estimate model size in GB based on config."""
+    try:
+        config = AutoConfig.from_pretrained(model_id_or_path, local_files_only=local_files_only)
+        # Rough estimation: num_layers * hidden_size * hidden_size * 4 bytes (float32)
+        # This is a very rough estimate, actual size may vary
+        if hasattr(config, 'num_hidden_layers') and hasattr(config, 'hidden_size'):
+            num_layers = config.num_hidden_layers
+            hidden_size = config.hidden_size
+            # Estimate for transformer layers (attention + MLP)
+            params_per_layer = hidden_size * hidden_size * 4  # 4 matrices per layer
+            total_params = num_layers * params_per_layer
+            # Add embedding and output layers
+            total_params += hidden_size * config.vocab_size * 2  # input and output embeddings
+            size_gb = (total_params * 4) / (1024**3)  # 4 bytes per parameter
+            return size_gb
+    except Exception:
+        pass
+    return 7.0  # Default estimate for 7B models
 
 
 _DTYPE_MAP = {
@@ -97,6 +127,19 @@ def quantize_to_hf(
     if quantization not in {"bnb-4bit", "bnb-8bit", "int8-dynamic", "none"}:
         raise ValueError("quantization must be one of: 'bnb-4bit', 'bnb-8bit', 'int8-dynamic', 'none'")
 
+    # Check memory availability before loading
+    estimated_size = _get_model_size_estimate(model_id_or_path, local_files_only)
+    required_memory = estimated_size * 1.5  # Add 50% buffer for processing
+    
+    if not _check_memory_availability(required_memory):
+        available_gb = psutil.virtual_memory().available / (1024**3)
+        raise RuntimeError(
+            f"Insufficient memory: estimated {estimated_size:.1f}GB model requires ~{required_memory:.1f}GB, "
+            f"but only {available_gb:.1f}GB available. Consider using a smaller model or adding swap space."
+        )
+    
+    logger.info(f"Loading model (estimated {estimated_size:.1f}GB) with {quantization} quantization...")
+
     # Detect if the source model is already pre-quantized with a non-BitsAndBytes
     # quantizer (e.g., MxFP4). If so, avoid passing a BitsAndBytesConfig which
     # would conflict with the existing quantization config.
@@ -121,68 +164,84 @@ def quantize_to_hf(
         )
         quant_config = None
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_id_or_path,
-        revision=revision,
-        use_fast=True,
-        trust_remote_code=trust_remote_code,
-        local_files_only=local_files_only,
-    )
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_id_or_path,
+            revision=revision,
+            use_fast=True,
+            trust_remote_code=trust_remote_code,
+            local_files_only=local_files_only,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Failed to load tokenizer: {e}")
 
-    if quantization == "int8-dynamic":
-        AutoModelClass = _get_auto_model_class(
-            model_id_or_path, revision, trust_remote_code=trust_remote_code, local_files_only=local_files_only
-        )
-        # Load in float on CPU, then apply PyTorch dynamic quantization to Linear layers
-        model = AutoModelClass.from_pretrained(
-            model_id_or_path,
-            revision=revision,
-            trust_remote_code=trust_remote_code,
-            device_map="cpu",
-            dtype=torch.float32,
-            local_files_only=local_files_only,
-        )
-        if prune and prune > 0.0:
+    model = None
+    try:
+        if quantization == "int8-dynamic":
+            AutoModelClass = _get_auto_model_class(
+                model_id_or_path, revision, trust_remote_code=trust_remote_code, local_files_only=local_files_only
+            )
+            # Load in float on CPU, then apply PyTorch dynamic quantization to Linear layers
+            model = AutoModelClass.from_pretrained(
+                model_id_or_path,
+                revision=revision,
+                trust_remote_code=trust_remote_code,
+                device_map="cpu",
+                dtype=torch.float32,
+                local_files_only=local_files_only,
+            )
+            if prune and prune > 0.0:
+                apply_global_magnitude_pruning(model, prune)
+            model = tq.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+        elif quant_config is not None:
+            AutoModelClass = _get_auto_model_class(
+                model_id_or_path, revision, trust_remote_code=trust_remote_code, local_files_only=local_files_only
+            )
+            # If user requested CPU device map, force CPU to avoid CUDA allocations from BnB/MxFP4 integrations
+            effective_device_map = device_map
+            if isinstance(effective_device_map, str) and effective_device_map.lower() == "cpu":
+                effective_device_map = "cpu"
+            model = AutoModelClass.from_pretrained(
+                model_id_or_path,
+                revision=revision,
+                trust_remote_code=trust_remote_code,
+                device_map=effective_device_map,
+                quantization_config=quant_config,
+                local_files_only=local_files_only,
+            )
+        else:
+            torch_dtype = _DTYPE_MAP.get(dtype)
+            AutoModelClass = _get_auto_model_class(
+                model_id_or_path, revision, trust_remote_code=trust_remote_code, local_files_only=local_files_only
+            )
+            # Respect explicit CPU request; avoids CUDA allocations during dequant of pre-quantized models
+            effective_device_map = device_map
+            if isinstance(effective_device_map, str) and effective_device_map.lower() == "cpu":
+                effective_device_map = "cpu"
+            model = AutoModelClass.from_pretrained(
+                model_id_or_path,
+                revision=revision,
+                trust_remote_code=trust_remote_code,
+                device_map=effective_device_map,
+                dtype=torch_dtype,
+                local_files_only=local_files_only,
+            )
+            if prune and prune > 0.0:
+                apply_global_magnitude_pruning(model, prune)
+        # For bnb and none paths, optionally prune after load above. For int8-dynamic we already pruned before quant.
+        if quantization in {"bnb-4bit", "bnb-8bit"} and prune and prune > 0.0:
             apply_global_magnitude_pruning(model, prune)
-        model = tq.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
-    elif quant_config is not None:
-        AutoModelClass = _get_auto_model_class(
-            model_id_or_path, revision, trust_remote_code=trust_remote_code, local_files_only=local_files_only
-        )
-        # If user requested CPU device map, force CPU to avoid CUDA allocations from BnB/MxFP4 integrations
-        effective_device_map = device_map
-        if isinstance(effective_device_map, str) and effective_device_map.lower() == "cpu":
-            effective_device_map = "cpu"
-        model = AutoModelClass.from_pretrained(
-            model_id_or_path,
-            revision=revision,
-            trust_remote_code=trust_remote_code,
-            device_map=effective_device_map,
-            quantization_config=quant_config,
-            local_files_only=local_files_only,
-        )
-    else:
-        torch_dtype = _DTYPE_MAP.get(dtype)
-        AutoModelClass = _get_auto_model_class(
-            model_id_or_path, revision, trust_remote_code=trust_remote_code, local_files_only=local_files_only
-        )
-        # Respect explicit CPU request; avoids CUDA allocations during dequant of pre-quantized models
-        effective_device_map = device_map
-        if isinstance(effective_device_map, str) and effective_device_map.lower() == "cpu":
-            effective_device_map = "cpu"
-        model = AutoModelClass.from_pretrained(
-            model_id_or_path,
-            revision=revision,
-            trust_remote_code=trust_remote_code,
-            device_map=effective_device_map,
-            dtype=torch_dtype,
-            local_files_only=local_files_only,
-        )
-        if prune and prune > 0.0:
-            apply_global_magnitude_pruning(model, prune)
-    # For bnb and none paths, optionally prune after load above. For int8-dynamic we already pruned before quant.
-    if quantization in {"bnb-4bit", "bnb-8bit"} and prune and prune > 0.0:
-        apply_global_magnitude_pruning(model, prune)
+    except Exception as e:
+        # Clean up any partially loaded model
+        if model is not None:
+            try:
+                del model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+            except Exception:
+                pass
+        raise RuntimeError(f"Failed to load model: {e}")
 
     # Ensure inference mode prior to saving
     model.eval()

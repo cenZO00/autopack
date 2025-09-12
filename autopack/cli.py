@@ -2,8 +2,10 @@ import argparse
 import os
 import sys
 import json
+import gc
 from typing import List, Optional, Tuple, Dict
 
+import torch
 from . import __version__
 from .quantize import quantize_to_hf
 from .exporters import export_onnx, export_gguf
@@ -125,6 +127,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         choices=["bnb-4bit", "bnb-8bit", "int8-dynamic", "bf16"],
         default=None,
         help="Produce a single HF variant (convenience alias for --hf-variants <one>)",
+    )
+    a.add_argument(
+        "--max-memory-gb",
+        type=float,
+        default=None,
+        help="Maximum memory usage in GB (will skip variants that would exceed this limit)",
+    )
+    a.add_argument(
+        "--memory-safe",
+        action="store_true",
+        help="Enable memory-safe mode (process one variant at a time with aggressive cleanup)",
     )
 
     # quantize command
@@ -455,19 +468,52 @@ def run_auto(args: argparse.Namespace) -> int:
             pbar.set_description(f"HF {name}")
             out_dir = os.path.join(args.output_dir, name)
             os.makedirs(out_dir, exist_ok=True)
-            quantize_to_hf(
-                model_id_or_path=source_model,
-                output_dir=out_dir,
-                quantization=params["quantization"],
-                dtype=params["dtype"],
-                device_map=params["device_map"],
-                trust_remote_code=args.trust_remote_code,
-                revision=args.revision,
-                # Hint downstream loader to avoid accidental CUDA use in integrations
-                local_files_only=True,
-            )
-            size_bytes = _dir_size(out_dir)
-            results.append((name, out_dir, size_bytes))
+            
+            # Check memory constraints
+            if getattr(args, "max_memory_gb", None):
+                try:
+                    import psutil
+                    available_gb = psutil.virtual_memory().available / (1024**3)
+                    if available_gb < args.max_memory_gb:
+                        print(f"  - Skipping {name}: only {available_gb:.1f}GB available, need {args.max_memory_gb:.1f}GB")
+                        results.append((name, out_dir, 0))
+                        pbar.update(1)
+                        continue
+                except ImportError:
+                    pass  # psutil not available, continue anyway
+            
+            # Add memory check before each variant
+            try:
+                print(f"  - Processing {name} variant...")
+                quantize_to_hf(
+                    model_id_or_path=source_model,
+                    output_dir=out_dir,
+                    quantization=params["quantization"],
+                    dtype=params["dtype"],
+                    device_map=params["device_map"],
+                    trust_remote_code=args.trust_remote_code,
+                    revision=args.revision,
+                    # Hint downstream loader to avoid accidental CUDA use in integrations
+                    local_files_only=True,
+                )
+                size_bytes = _dir_size(out_dir)
+                results.append((name, out_dir, size_bytes))
+                print(f"  - Completed {name}: {_human_size(size_bytes)}")
+            except Exception as e:
+                print(f"  - Skipping {name} due to error: {e}")
+                # Create empty directory entry to maintain progress tracking
+                results.append((name, out_dir, 0))
+            finally:
+                # Force garbage collection between variants
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                # Additional cleanup in memory-safe mode
+                if getattr(args, "memory_safe", False):
+                    import time
+                    time.sleep(1)  # Give system time to reclaim memory
+            
             pbar.update(1)
 
             # Run perplexity evaluation if requested

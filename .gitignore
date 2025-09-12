@@ -29,3 +29,4 @@ third_party/llama.cpp/**/.cache/
 third_party/llama.cpp/**/*.o
 third_party/llama.cpp/**/*.a
 third_party/llama.cpp/**/*.so
+/tiny-gpt2

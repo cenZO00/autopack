@@ -29,9 +29,53 @@ def _suppress_transformers_progress():
         os.environ["TRANSFORMERS_VERBOSITY"] = "error"
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
-        # Disable tqdm globally for transformers
-        import tqdm
-        tqdm.tqdm.__init__ = lambda self, *args, **kwargs: super(tqdm.tqdm, self).__init__(*args, **kwargs, disable=True) if 'transformers' in str(self) else super(tqdm.tqdm, self).__init__(*args, **kwargs)
+        # Try dedicated library controls if available
+        try:
+            # Some versions expose explicit progress bar toggles
+            from transformers.utils.logging import disable_progress_bar as _hf_disable_pb  # type: ignore
+            try:
+                _hf_disable_pb()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        try:
+            from huggingface_hub.utils import disable_progress_bars as _hub_disable_pbs  # type: ignore
+            try:
+                _hub_disable_pbs()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # As a last resort, patch tqdm.__init__ safely to auto-disable when called
+        # from transformers or huggingface_hub. We avoid calling str(self) before init.
+        try:
+            import inspect
+            import tqdm as _tqdm
+
+            original_init = _tqdm.tqdm.__init__
+
+            def _patched_init(self, *args, **kwargs):
+                disable_kwarg = kwargs.get("disable", None)
+                # If the caller did not explicitly set disable, decide based on call stack
+                if disable_kwarg is None:
+                    try:
+                        stack = inspect.stack()
+                        called_from_hf = any(
+                            (frame.filename and ("transformers" in frame.filename or "huggingface_hub" in frame.filename))
+                            for frame in stack
+                        )
+                    except Exception:
+                        called_from_hf = False
+                    if called_from_hf:
+                        kwargs["disable"] = True
+                return original_init(self, *args, **kwargs)
+
+            _tqdm.tqdm.__init__ = _patched_init  # type: ignore[method-assign]
+        except Exception:
+            pass
     except Exception:
         pass
 

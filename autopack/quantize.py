@@ -24,23 +24,60 @@ def _suppress_transformers_progress():
     try:
         from transformers.utils import logging as hf_logging
         hf_logging.set_verbosity_error()
-        # Also disable tqdm for transformers
+        # Disable all transformers progress bars
         import os
         os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+        # Disable tqdm globally for transformers
+        import tqdm
+        tqdm.tqdm.__init__ = lambda self, *args, **kwargs: super(tqdm.tqdm, self).__init__(*args, **kwargs, disable=True) if 'transformers' in str(self) else super(tqdm.tqdm, self).__init__(*args, **kwargs)
     except Exception:
         pass
 
 
-def _create_quantization_progress_bar(total_steps: int, desc: str) -> tqdm:
-    """Create a custom progress bar for quantization."""
-    return tqdm(
-        total=total_steps,
-        desc=desc,
-        unit="step",
-        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
-        ncols=100,
-        leave=True
-    )
+class CleanProgressBar:
+    """A single, clean progress bar for all operations."""
+    
+    def __init__(self, total: int, desc: str = "Processing"):
+        self.total = total
+        self.current = 0
+        self.desc = desc
+        self.current_step = ""
+        self.start_time = None
+        self.pbar = None
+        
+    def start(self):
+        """Start the progress bar."""
+        import time
+        self.start_time = time.time()
+        self.pbar = tqdm(
+            total=self.total,
+            desc=self.desc,
+            unit="variant",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+            ncols=120,
+            leave=True,
+            dynamic_ncols=False
+        )
+        
+    def update_step(self, step: str):
+        """Update the current step description."""
+        self.current_step = step
+        if self.pbar:
+            self.pbar.set_postfix_str(step)
+            
+    def update(self, n: int = 1):
+        """Update progress."""
+        self.current += n
+        if self.pbar:
+            self.pbar.update(n)
+            
+    def close(self):
+        """Close the progress bar."""
+        if self.pbar:
+            self.pbar.close()
+            self.pbar = None
 
 
 def _check_memory_availability(required_gb: float = 8.0) -> bool:
@@ -196,170 +233,102 @@ def quantize_to_hf(
     # Suppress transformers progress bars
     _suppress_transformers_progress()
     
-    # Create progress bar for quantization steps
-    progress_steps = 5  # config, tokenizer, model, quantization, saving
-    pbar = _create_quantization_progress_bar(progress_steps, f"Quantizing ({quantization})")
-    
+    # Detect if the source model is already pre-quantized with a non-BitsAndBytes
+    # quantizer (e.g., MxFP4). If so, avoid passing a BitsAndBytesConfig which
+    # would conflict with the existing quantization config.
     try:
-        pbar.set_description(f"Loading config...")
-        # Detect if the source model is already pre-quantized with a non-BitsAndBytes
-        # quantizer (e.g., MxFP4). If so, avoid passing a BitsAndBytesConfig which
-        # would conflict with the existing quantization config.
-        try:
-            src_config = AutoConfig.from_pretrained(
-                model_id_or_path,
-                revision=revision,
-                trust_remote_code=trust_remote_code,
-                local_files_only=local_files_only,
-            )
-            existing_qc = getattr(src_config, "quantization_config", None)
-            is_pre_quantized = bool(existing_qc) and not isinstance(existing_qc, BitsAndBytesConfig)
-        except Exception:
-            src_config = None
-            is_pre_quantized = False
-        pbar.update(1)
+        src_config = AutoConfig.from_pretrained(
+            model_id_or_path,
+            revision=revision,
+            trust_remote_code=trust_remote_code,
+            local_files_only=local_files_only,
+        )
+        existing_qc = getattr(src_config, "quantization_config", None)
+        is_pre_quantized = bool(existing_qc) and not isinstance(existing_qc, BitsAndBytesConfig)
+    except Exception:
+        src_config = None
+        is_pre_quantized = False
 
-        quant_config = _build_bnb_config(quantization, dtype)
-        if is_pre_quantized and quant_config is not None:
-            logger.warning(
-                "Detected existing non-BitsAndBytes quantization in source model; "
-                "skipping BitsAndBytes quantization and loading as-is."
-            )
-            quant_config = None
+    quant_config = _build_bnb_config(quantization, dtype)
+    if is_pre_quantized and quant_config is not None:
+        logger.warning(
+            "Detected existing non-BitsAndBytes quantization in source model; "
+            "skipping BitsAndBytes quantization and loading as-is."
+        )
+        quant_config = None
 
-        pbar.set_description(f"Loading tokenizer...")
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_id_or_path,
-                revision=revision,
-                use_fast=True,
-                trust_remote_code=trust_remote_code,
-                local_files_only=local_files_only,
-            )
-        except Exception as e:
-            raise RuntimeError(f"Failed to load tokenizer: {e}")
-        pbar.update(1)
-
-        pbar.set_description(f"Loading model ({estimated_size:.1f}GB)...")
-        model = None
-        try:
-            if quantization == "int8-dynamic":
-                AutoModelClass = _get_auto_model_class(
-                    model_id_or_path, revision, trust_remote_code=trust_remote_code, local_files_only=local_files_only
-                )
-                # Load in float on CPU, then apply PyTorch dynamic quantization to Linear layers
-                model = AutoModelClass.from_pretrained(
-                    model_id_or_path,
-                    revision=revision,
-                    trust_remote_code=trust_remote_code,
-                    device_map="cpu",
-                    dtype=torch.float32,
-                    local_files_only=local_files_only,
-                )
-                if prune and prune > 0.0:
-                    apply_global_magnitude_pruning(model, prune)
-                model = tq.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
-            elif quant_config is not None:
-                AutoModelClass = _get_auto_model_class(
-                    model_id_or_path, revision, trust_remote_code=trust_remote_code, local_files_only=local_files_only
-                )
-                # If user requested CPU device map, force CPU to avoid CUDA allocations from BnB/MxFP4 integrations
-                effective_device_map = device_map
-                if isinstance(effective_device_map, str) and effective_device_map.lower() == "cpu":
-                    effective_device_map = "cpu"
-                model = AutoModelClass.from_pretrained(
-                    model_id_or_path,
-                    revision=revision,
-                    trust_remote_code=trust_remote_code,
-                    device_map=effective_device_map,
-                    quantization_config=quant_config,
-                    local_files_only=local_files_only,
-                )
-            else:
-                torch_dtype = _DTYPE_MAP.get(dtype)
-                AutoModelClass = _get_auto_model_class(
-                    model_id_or_path, revision, trust_remote_code=trust_remote_code, local_files_only=local_files_only
-                )
-                # Respect explicit CPU request; avoids CUDA allocations during dequant of pre-quantized models
-                effective_device_map = device_map
-                if isinstance(effective_device_map, str) and effective_device_map.lower() == "cpu":
-                    effective_device_map = "cpu"
-                model = AutoModelClass.from_pretrained(
-                    model_id_or_path,
-                    revision=revision,
-                    trust_remote_code=trust_remote_code,
-                    device_map=effective_device_map,
-                    dtype=torch_dtype,
-                    local_files_only=local_files_only,
-                )
-                if prune and prune > 0.0:
-                    apply_global_magnitude_pruning(model, prune)
-            # For bnb and none paths, optionally prune after load above. For int8-dynamic we already pruned before quant.
-            if quantization in {"bnb-4bit", "bnb-8bit"} and prune and prune > 0.0:
-                apply_global_magnitude_pruning(model, prune)
-        except Exception as e:
-            pbar.close()
-            # Clean up any partially loaded model
-            if model is not None:
-                try:
-                    del model
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    gc.collect()
-                except Exception:
-                    pass
-            raise RuntimeError(f"Failed to load model: {e}")
-        
-        pbar.update(1)
-
-        pbar.set_description(f"Applying quantization...")
-        # Ensure inference mode prior to saving
-        model.eval()
-        if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
-            tokenizer.pad_token = tokenizer.eos_token
-        pbar.update(1)
-
-        pbar.set_description(f"Saving model...")
-        # Robust save: try safetensors, fallback to PyTorch if shared tensors error
-        try:
-            model.save_pretrained(output_dir, safe_serialization=True)
-        except Exception as e:
-            logger.debug(f"Safe serialization failed: {e}")
-            try:
-                # Fallback when tensors share storage (e.g., some BERT heads)
-                model.save_pretrained(output_dir, safe_serialization=False)
-            except Exception as e2:
-                logger.debug(f"Standard serialization also failed: {e2}")
-                # Last resort: save state dict manually
-                import os
-                os.makedirs(output_dir, exist_ok=True)
-                torch.save(model.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
-                # Save config
-                model.config.save_pretrained(output_dir)
-        tokenizer.save_pretrained(output_dir)
-        pbar.update(1)
-
-        pbar.set_description(f"Cleaning up...")
-        # Proactively free memory to avoid OOM across sequential variants
-        try:
-            del model
-        except Exception:
-            pass
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-        gc.collect()
-        pbar.update(1)
-        
-        pbar.set_description(f"Completed!")
-        pbar.close()
-
+    # Load tokenizer
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_id_or_path,
+            revision=revision,
+            use_fast=True,
+            trust_remote_code=trust_remote_code,
+            local_files_only=local_files_only,
+        )
     except Exception as e:
-        pbar.close()
+        raise RuntimeError(f"Failed to load tokenizer: {e}")
+
+    # Load model
+    model = None
+    try:
+        if quantization == "int8-dynamic":
+            AutoModelClass = _get_auto_model_class(
+                model_id_or_path, revision, trust_remote_code=trust_remote_code, local_files_only=local_files_only
+            )
+            # Load in float on CPU, then apply PyTorch dynamic quantization to Linear layers
+            model = AutoModelClass.from_pretrained(
+                model_id_or_path,
+                revision=revision,
+                trust_remote_code=trust_remote_code,
+                device_map="cpu",
+                dtype=torch.float32,
+                local_files_only=local_files_only,
+            )
+            if prune and prune > 0.0:
+                apply_global_magnitude_pruning(model, prune)
+            model = tq.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+        elif quant_config is not None:
+            AutoModelClass = _get_auto_model_class(
+                model_id_or_path, revision, trust_remote_code=trust_remote_code, local_files_only=local_files_only
+            )
+            # If user requested CPU device map, force CPU to avoid CUDA allocations from BnB/MxFP4 integrations
+            effective_device_map = device_map
+            if isinstance(effective_device_map, str) and effective_device_map.lower() == "cpu":
+                effective_device_map = "cpu"
+            model = AutoModelClass.from_pretrained(
+                model_id_or_path,
+                revision=revision,
+                trust_remote_code=trust_remote_code,
+                device_map=effective_device_map,
+                quantization_config=quant_config,
+                local_files_only=local_files_only,
+            )
+        else:
+            torch_dtype = _DTYPE_MAP.get(dtype)
+            AutoModelClass = _get_auto_model_class(
+                model_id_or_path, revision, trust_remote_code=trust_remote_code, local_files_only=local_files_only
+            )
+            # Respect explicit CPU request; avoids CUDA allocations during dequant of pre-quantized models
+            effective_device_map = device_map
+            if isinstance(effective_device_map, str) and effective_device_map.lower() == "cpu":
+                effective_device_map = "cpu"
+            model = AutoModelClass.from_pretrained(
+                model_id_or_path,
+                revision=revision,
+                trust_remote_code=trust_remote_code,
+                device_map=effective_device_map,
+                dtype=torch_dtype,
+                local_files_only=local_files_only,
+            )
+            if prune and prune > 0.0:
+                apply_global_magnitude_pruning(model, prune)
+        # For bnb and none paths, optionally prune after load above. For int8-dynamic we already pruned before quant.
+        if quantization in {"bnb-4bit", "bnb-8bit"} and prune and prune > 0.0:
+            apply_global_magnitude_pruning(model, prune)
+    except Exception as e:
         # Clean up any partially loaded model
-        if 'model' in locals() and model is not None:
+        if model is not None:
             try:
                 del model
                 if torch.cuda.is_available():
@@ -367,7 +336,42 @@ def quantize_to_hf(
                 gc.collect()
             except Exception:
                 pass
-        raise RuntimeError(f"Quantization failed: {e}")
+        raise RuntimeError(f"Failed to load model: {e}")
+
+    # Ensure inference mode prior to saving
+    model.eval()
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Robust save: try safetensors, fallback to PyTorch if shared tensors error
+    try:
+        model.save_pretrained(output_dir, safe_serialization=True)
+    except Exception as e:
+        logger.debug(f"Safe serialization failed: {e}")
+        try:
+            # Fallback when tensors share storage (e.g., some BERT heads)
+            model.save_pretrained(output_dir, safe_serialization=False)
+        except Exception as e2:
+            logger.debug(f"Standard serialization also failed: {e2}")
+            # Last resort: save state dict manually
+            import os
+            os.makedirs(output_dir, exist_ok=True)
+            torch.save(model.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
+            # Save config
+            model.config.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    
+    # Proactively free memory to avoid OOM across sequential variants
+    try:
+        del model
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    gc.collect()
 
     return output_dir
 

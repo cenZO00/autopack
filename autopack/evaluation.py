@@ -21,20 +21,38 @@ def _measure_generation_latency(
     """
     # Warmup
     for _ in range(num_warmup):
-        _ = generate_fn(prompt_ids)
+        try:
+            _ = generate_fn(prompt_ids)
+        except Exception as e:
+            print(f"Warning: Warmup failed: {e}")
+            return 0.0, 0.0, 0
 
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     start = time.perf_counter()
     total_new_tokens = 0
-    total_new_tokens = 0
+    successful_runs = 0
+    
     for _ in range(num_runs):
-        out_ids = generate_fn(prompt_ids)
-        total_new_tokens += max(0, out_ids.shape[1] - prompt_ids.shape[1])
+        try:
+            out_ids = generate_fn(prompt_ids)
+            new_tokens = max(0, out_ids.shape[1] - prompt_ids.shape[1])
+            total_new_tokens += new_tokens
+            successful_runs += 1
+        except Exception as e:
+            print(f"Warning: Generation run failed: {e}")
+            continue
+    
     end = time.perf_counter()
-    duration = (end - start) / max(1, num_runs)
-    tps = (total_new_tokens / max(1, num_runs)) / max(duration, 1e-9)
-    avg_new_tokens = int(round(total_new_tokens / max(1, num_runs)))
-    return duration, tps, avg_new_tokens
+    
+    if successful_runs == 0:
+        return 0.0, 0.0, 0
+    
+    total_duration = end - start
+    avg_duration = total_duration / successful_runs
+    avg_new_tokens = int(round(total_new_tokens / successful_runs))
+    tps = avg_new_tokens / max(avg_duration, 1e-9)
+    
+    return avg_duration, tps, avg_new_tokens
 
 
 def calculate_perplexity(
@@ -127,26 +145,54 @@ def benchmark_hf(
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id_or_path, trust_remote_code=trust_remote_code)
-    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
-        tokenizer.pad_token = tokenizer.eos_token
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_id_or_path, trust_remote_code=trust_remote_code)
+        if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+    except Exception as e:
+        raise RuntimeError(f"Failed to load tokenizer: {e}")
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id_or_path, trust_remote_code=trust_remote_code
-    ).to(device)
-    model.eval()
+    try:
+        # Load model with device_map="auto" to handle device placement automatically
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id_or_path, 
+            trust_remote_code=trust_remote_code,
+            device_map="auto" if device == "cuda" else "cpu",
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32
+        )
+        model.eval()
+    except Exception as e:
+        raise RuntimeError(f"Failed to load model: {e}")
 
-    prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    try:
+        prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids
+        # Move to the same device as the model
+        if hasattr(model, 'device'):
+            prompt_ids = prompt_ids.to(model.device)
+        elif device == "cuda" and torch.cuda.is_available():
+            prompt_ids = prompt_ids.cuda()
+    except Exception as e:
+        raise RuntimeError(f"Failed to prepare input: {e}")
 
     def _gen(input_ids: torch.Tensor) -> torch.Tensor:
         with torch.inference_mode():
-            out = model.generate(input_ids, max_new_tokens=max_new_tokens)
-        return out
+            try:
+                out = model.generate(
+                    input_ids, 
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,  # Deterministic generation
+                    pad_token_id=tokenizer.eos_token_id if tokenizer.eos_token_id else 0
+                )
+                return out
+            except Exception as e:
+                print(f"Generation error: {e}")
+                # Return input if generation fails
+                return input_ids
 
     latency_s, tokens_per_s, new_tokens = _measure_generation_latency(_gen, prompt_ids, num_warmup, num_runs)
 
     max_mem = None
-    if device == "cuda":
+    if device == "cuda" and torch.cuda.is_available():
         try:
             max_mem = torch.cuda.max_memory_allocated()
             torch.cuda.reset_max_memory_allocated()

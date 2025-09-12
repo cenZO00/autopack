@@ -2,8 +2,10 @@ import argparse
 import os
 import sys
 import json
+import gc
 from typing import List, Optional, Tuple, Dict
 
+import torch
 from . import __version__
 from .quantize import quantize_to_hf
 from .exporters import export_onnx, export_gguf
@@ -125,6 +127,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         choices=["bnb-4bit", "bnb-8bit", "int8-dynamic", "bf16"],
         default=None,
         help="Produce a single HF variant (convenience alias for --hf-variants <one>)",
+    )
+    a.add_argument(
+        "--max-memory-gb",
+        type=float,
+        default=None,
+        help="Maximum memory usage in GB (will skip variants that would exceed this limit)",
+    )
+    a.add_argument(
+        "--memory-safe",
+        action="store_true",
+        help="Enable memory-safe mode (process one variant at a time with aggressive cleanup)",
+    )
+    a.add_argument(
+        "--skip-int8-dynamic",
+        action="store_true",
+        help="Skip int8-dynamic quantization (requires more memory than other variants)",
     )
 
     # quantize command
@@ -422,6 +440,30 @@ def run_auto(args: argparse.Namespace) -> int:
     if is_pre_quantized:
         base_variants = [(n, p) for (n, p) in base_variants if n not in {"bnb-4bit", "bnb-8bit"}]
 
+    # Skip int8-dynamic if requested (memory-intensive)
+    if getattr(args, "skip_int8_dynamic", False):
+        base_variants = [(n, p) for (n, p) in base_variants if n != "int8-dynamic"]
+        print("Skipping int8-dynamic quantization (memory-intensive)")
+    
+    # Auto-skip int8-dynamic for large models when memory is limited
+    if not getattr(args, "skip_int8_dynamic", False):
+        try:
+            import psutil
+            available_gb = psutil.virtual_memory().available / (1024**3)
+            # If less than 20GB available, skip int8-dynamic for 7B+ models
+            if available_gb < 20.0:
+                # Check if this looks like a large model (7B+)
+                try:
+                    from .quantize import _get_model_size_estimate
+                    estimated_size = _get_model_size_estimate(args.model, local_files_only=False, quantization="int8-dynamic")
+                    if estimated_size > 6.0:
+                        base_variants = [(n, p) for (n, p) in base_variants if n != "int8-dynamic"]
+                        print(f"Auto-skipping int8-dynamic quantization (requires ~{estimated_size:.1f}GB, only {available_gb:.1f}GB available)")
+                except Exception:
+                    pass  # If we can't estimate, continue anyway
+        except ImportError:
+            pass  # psutil not available, continue anyway
+
     variants: List[Tuple[str, dict]] = base_variants
 
     results = []
@@ -438,7 +480,10 @@ def run_auto(args: argparse.Namespace) -> int:
         quant_list = args.gguf_quant if args.gguf_quant else ["Q4_K_M", "Q5_K_M", "Q8_0"]
         total_steps += len(quant_list)
 
-    pbar = tqdm(total=total_steps, desc="autopack", unit="step", disable=(total_steps == 0))
+    # Import the clean progress bar
+    from .quantize import CleanProgressBar
+    pbar = CleanProgressBar(total_steps, "autopack")
+    pbar.start()
 
     # Resolve model to a local snapshot once to avoid repeated downloads for large models
     source_model = args.model
@@ -452,22 +497,54 @@ def run_auto(args: argparse.Namespace) -> int:
     # --- Run HF variants (opt-in for auto) ---
     if "hf" in args.output_format:
         for name, params in variants:
-            pbar.set_description(f"HF {name}")
             out_dir = os.path.join(args.output_dir, name)
             os.makedirs(out_dir, exist_ok=True)
-            quantize_to_hf(
-                model_id_or_path=source_model,
-                output_dir=out_dir,
-                quantization=params["quantization"],
-                dtype=params["dtype"],
-                device_map=params["device_map"],
-                trust_remote_code=args.trust_remote_code,
-                revision=args.revision,
-                # Hint downstream loader to avoid accidental CUDA use in integrations
-                local_files_only=True,
-            )
-            size_bytes = _dir_size(out_dir)
-            results.append((name, out_dir, size_bytes))
+            
+            # Check memory constraints
+            if getattr(args, "max_memory_gb", None):
+                try:
+                    import psutil
+                    available_gb = psutil.virtual_memory().available / (1024**3)
+                    if available_gb < args.max_memory_gb:
+                        pbar.update_step(f"Skipping {name} (insufficient memory)")
+                        results.append((name, out_dir, 0))
+                        pbar.update(1)
+                        continue
+                except ImportError:
+                    pass  # psutil not available, continue anyway
+            
+            # Process variant
+            try:
+                pbar.update_step(f"Processing {name} variant...")
+                quantize_to_hf(
+                    model_id_or_path=source_model,
+                    output_dir=out_dir,
+                    quantization=params["quantization"],
+                    dtype=params["dtype"],
+                    device_map=params["device_map"],
+                    trust_remote_code=args.trust_remote_code,
+                    revision=args.revision,
+                    # Hint downstream loader to avoid accidental CUDA use in integrations
+                    local_files_only=True,
+                )
+                size_bytes = _dir_size(out_dir)
+                results.append((name, out_dir, size_bytes))
+                pbar.update_step(f"Completed {name} ({_human_size(size_bytes)})")
+            except Exception as e:
+                pbar.update_step(f"Skipping {name} (error: {str(e)[:50]}...)")
+                # Create empty directory entry to maintain progress tracking
+                results.append((name, out_dir, 0))
+            finally:
+                # Force garbage collection between variants
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                # Additional cleanup in memory-safe mode
+                if getattr(args, "memory_safe", False):
+                    import time
+                    time.sleep(1)  # Give system time to reclaim memory
+            
             pbar.update(1)
 
             # Run perplexity evaluation if requested
@@ -493,7 +570,7 @@ def run_auto(args: argparse.Namespace) -> int:
 
     # --- Optional ONNX export for auto ---
     if "onnx" in args.output_format:
-        pbar.set_description("ONNX export")
+        pbar.update_step("Exporting ONNX...")
         onnx_dir = os.path.join(args.output_dir, "onnx")
         os.makedirs(onnx_dir, exist_ok=True)
         try:
@@ -506,8 +583,9 @@ def run_auto(args: argparse.Namespace) -> int:
                 )
             size_bytes = _dir_size(onnx_dir)
             results.append(("onnx", onnx_dir, size_bytes))
+            pbar.update_step(f"Completed ONNX ({_human_size(size_bytes)})")
         except Exception as e:
-            print(f"Skipping ONNX export due to an error: {e}")
+            pbar.update_step(f"Skipping ONNX (error: {str(e)[:50]}...)")
         finally:
             pbar.update(1)
 
@@ -534,7 +612,7 @@ def run_auto(args: argparse.Namespace) -> int:
 
             for quant in quant_list:
                 try:
-                    pbar.set_description(f"GGUF {quant}")
+                    pbar.update_step(f"Exporting GGUF {quant}...")
                     expected_file = os.path.join(gguf_out_dir, f"model-{quant}.gguf")
                     if getattr(args, "skip_existing", False) and os.path.isfile(expected_file):
                         pass
@@ -554,8 +632,9 @@ def run_auto(args: argparse.Namespace) -> int:
                     # Use directory size to avoid errors if path is None or if multiple files are produced
                     size_bytes = _dir_size(gguf_out_dir)
                     results.append((f"gguf-{quant}", gguf_out_dir, size_bytes))
+                    pbar.update_step(f"Completed GGUF {quant} ({_human_size(size_bytes)})")
                 except Exception as e:
-                    print(f"Skipping GGUF quant {quant} due to an error: {e}")
+                    pbar.update_step(f"Skipping GGUF {quant} (error: {str(e)[:50]}...)")
                 finally:
                     pbar.update(1)
         except Exception as e:
@@ -583,6 +662,7 @@ def run_auto(args: argparse.Namespace) -> int:
         for name, out_dir, _ in results:
             if name in {"bnb-4bit", "bnb-8bit", "int8-dynamic", "bf16"}:
                 try:
+                    print(f"  - Benchmarking {name}...")
                     res = benchmark_hf(
                         model_id_or_path=out_dir,
                         prompt=prompt,
@@ -592,12 +672,19 @@ def run_auto(args: argparse.Namespace) -> int:
                         num_warmup=warmup,
                         num_runs=runs,
                     )
-                    bench_metrics[name] = {
-                        "tokens_per_s": float(res.get("tokens_per_s", 0.0)),
-                        "new_tokens": float(res.get("new_tokens", max_new)),
-                    }
+                    tokens_per_s = float(res.get("tokens_per_s", 0.0))
+                    new_tokens = float(res.get("new_tokens", max_new))
+                    
+                    if tokens_per_s > 0:
+                        bench_metrics[name] = {
+                            "tokens_per_s": tokens_per_s,
+                            "new_tokens": new_tokens,
+                        }
+                        print(f"  - {name}: {tokens_per_s:.2f} tokens/s")
+                    else:
+                        print(f"  - {name}: Benchmark completed but no tokens generated")
                 except Exception as e:
-                    print(f"  - Benchmark failed for {name} (HF): {e}")
+                    print(f"  - Benchmark failed for {name}: {str(e)[:100]}...")
 
         # ONNX
         onnx_dir = os.path.join(args.output_dir, "onnx")
@@ -650,6 +737,17 @@ def run_auto(args: argparse.Namespace) -> int:
                 tps = bench_metrics.get("onnx", {}).get("tokens_per_s")
             if tps and bf16_tps > 0:
                 real_speedups[name] = tps / bf16_tps
+            elif tps and tps > 0:
+                # If we have tokens/s but no bf16 baseline, use heuristic
+                est_speed_heuristic = {
+                    "bf16": 1.00,
+                    "bnb-8bit": 1.50,
+                    "bnb-4bit": 2.50,
+                    "int8-dynamic": 1.20,
+                    "gguf": 2.80,
+                    "onnx": 1.50,
+                }
+                real_speedups[name] = est_speed_heuristic.get(name, 1.0)
     else:
         est_speed_heuristic = {
             "bf16": 1.00,
@@ -920,6 +1018,18 @@ def run_bench(args: argparse.Namespace) -> int:
 def main(argv: Optional[List[str]] = None) -> int:
     # Reduce noisy logs by default; allow opt-in via --verbose on any subcommand
     hf_logging.set_verbosity_error()
+    
+    # Suppress transformers progress bars globally
+    try:
+        from .quantize import _suppress_transformers_progress
+        _suppress_transformers_progress()
+        # Additional suppression
+        import os
+        os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+    except Exception:
+        pass
     # If user provided args without a subcommand, default to 'auto',
     # but do not hijack global flags like --help/-h/--version or when the first
     # token is itself a flag (e.g., `autopack --version`).

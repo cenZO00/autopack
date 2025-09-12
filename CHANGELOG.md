@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.4.0] - 2025-09-12
+
+### Changed
+- BitsAndBytes 4-bit defaults: prefer FP16 compute on CUDA (BF16 otherwise), disable double quantization to reduce per-token overhead while retaining `nf4` quant type.
+- BitsAndBytes 8-bit defaults: explicitly disable FP32 CPU offload and set `llm_int8_threshold=6.0` to avoid slow fallbacks.
+
+### Notes
+- These changes target more stable throughput and prevent accidental CPU offload. Quantization primarily reduces memory usage; FP16/BF16 can still be faster for batch=1 autoregressive generation on many GPUs.
+
+[0.1.4.0]: https://github.com/GranulaVision/autopack/releases/tag/v0.1.4.0
+
 ## [0.1.3.2] - 2025-09-10
 
 ### Added

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "autopack-grn"
-version = "0.1.4.0"
+version = "0.1.4.1"
 description = "CLI to quantize and release Hugging Face models in multiple formats"
 readme = "README.md"
 requires-python = ">=3.9"

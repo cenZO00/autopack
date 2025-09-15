@@ -10,6 +10,7 @@ from . import __version__
 from .quantize import quantize_to_hf
 from .exporters import export_onnx, export_gguf
 from .publish import publish_folder_to_hub
+from .scan import scan_model, print_scan_report
 from .evaluation import calculate_perplexity, benchmark_hf, benchmark_onnx, benchmark_gguf
 from transformers.utils import logging as hf_logging
 from huggingface_hub import snapshot_download
@@ -238,6 +239,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--branch", default=None, help="Target branch (revision)")
     p.add_argument("--commit-message", default="Add model artifacts via autopack", help="Commit message")
     p.add_argument("--no-create", action="store_true", help="Do not attempt to create the repo if missing")
+
+    # scan command
+    s = subparsers.add_parser("scan", help="Inspect a model or folder and suggest export options")
+    s.add_argument("--verbose", action="store_true", help="Enable verbose logs")
+    s.add_argument("model", help="Hugging Face repo id (user/model) or local path")
+    s.add_argument("--revision", default=None, help="Model revision/branch/tag to load (for Hub models)")
+    s.add_argument("--trust-remote-code", action="store_true", help="Allow custom code from model repos")
+    s.add_argument("--local-files-only", action="store_true", help="Do not make network calls when loading config/tokenizer")
+    s.add_argument("--resolve-cache", action="store_true", help="Resolve the model to a local snapshot for file listing/size")
+    s.add_argument("--json", dest="as_json", action="store_true", help="Print JSON output")
+    s.add_argument("--show-files", action="store_true", help="List top files by size when local or cached")
+    s.add_argument("--limit-files", type=int, default=50, help="Limit number of files to list with --show-files")
 
     # bench command
     b = subparsers.add_parser("bench", help="Benchmark model runtime(s) for latency and throughput")
@@ -1034,7 +1047,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # but do not hijack global flags like --help/-h/--version or when the first
     # token is itself a flag (e.g., `autopack --version`).
     tokens = sys.argv[1:] if argv is None else list(argv)
-    if tokens and (tokens[0] not in {"quantize", "publish", "auto", "bench"}):
+    if tokens and (tokens[0] not in {"quantize", "publish", "auto", "bench", "scan"}):
         is_global_help_or_version = any(t in {"-h", "--help", "--version"} for t in tokens)
         starts_with_flag = tokens[0].startswith("-")
         if not (is_global_help_or_version or starts_with_flag):
@@ -1071,6 +1084,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         return run_publish(args)
     if args.command == "bench":
         return run_bench(args)
+    if args.command == "scan":
+        report = scan_model(
+            model_id_or_path=args.model,
+            revision=args.revision,
+            trust_remote_code=args.trust_remote_code,
+            local_files_only=args.local_files_only,
+            resolve_cache=args.resolve_cache,
+        )
+        print_scan_report(report, as_json=args.as_json, show_files=args.show_files, limit_files=args.limit_files)
+        return 0
     raise ValueError(f"Unknown command: {args.command}")
 
 

@@ -136,6 +136,32 @@ autopack publish out/llama3-4bit your-username/llama3-4bit --private \
 
 ## Commands Overview
 
+### scan
+
+Inspect a model id or local folder and print metadata (config, sizes, quantization hints) with suggestions for next steps. Now includes human-readable sizes, file summary (config/tokenizer presence), weight file counts, and top-5 largest files.
+
+```bash
+autopack scan <model_id_or_path> \
+  [--revision <rev>] [--trust-remote-code] [--local-files-only] \
+  [--resolve-cache] [--json] [--show-files] [--limit-files 50]
+```
+
+Examples:
+
+```bash
+# Remote model (lightweight, no weight download). Prints human-readable summary
+autopack scan meta-llama/Llama-3-8B
+
+# JSON output suitable for scripting
+autopack scan meta-llama/Llama-3-8B --json
+
+# Resolve a local snapshot to list files and sizes
+autopack scan meta-llama/Llama-3-8B --resolve-cache --show-files --limit-files 20
+
+# Scan a local folder
+autopack scan ./tiny-gpt2
+```
+
 ### auto
 
 Run common HF quantization variants and optional ONNX/GGUF exports in one go, with a summary table and generated README in the output folder.

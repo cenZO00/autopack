@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.1.4.1] - 2025-09-15
+
+### Added
+- New `scan` subcommand to inspect models or local folders and print:
+  - Config summary (arch, layers, heads, context length, RoPE scaling)
+  - Tokenizer info and chat template presence
+  - Export support hints (HF/ONNX/GGUF suitability)
+  - Suggestions for next commands
+- Enhanced scan report details:
+  - Human-readable sizes and accurate weight/total bytes (local and remote)
+  - File summary: total files, `config.json` presence, tokenizer files present/missing
+  - Weight file counts (safetensors vs other)
+  - Top-5 largest files by size
+
+### Fixed
+- Correct size reporting for remote models using Hub metadata with `files_metadata=True`.
+
+[0.1.4.1]: https://github.com/GranulaVision/autopack/releases/tag/v0.1.4.1
+
 ## [0.1.4.0] - 2025-09-12
 
 ### Changed

